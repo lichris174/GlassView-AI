@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>GlassView AI</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script>
+      window.MathJax = {
+        tex: {
+          inlineMath: [["$", "$"], ["\\(", "\\)"]],
+          displayMath: [["$$", "$$"], ["\\[", "\\]"]],
+        },
+        svg: { fontCache: "global" },
+      };
+    </script>
+    <script
+      id="mathjax"
+      src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"
+      async
+      defer
+    ></script>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <div id="dragRegion"></div>
+      <div id="windowControls">
+        <button class="window-btn" id="minimizeBtn" title="Minimize">-</button>
+        <button class="window-btn" id="maximizeBtn" title="Maximize">[]</button>
+        <button class="window-btn" id="closeBtn" title="Close">x</button>
+      </div>
+
+      <div id="messages">
+        <div class="bubble ai">
+          Hi, I'm your screen assistant. Ask me anything about what's on your screen.
+        </div>
+      </div>
+
+      <div id="composer">
+        <textarea
+          id="inputText"
+          rows="3"
+          placeholder="Ask GlassView AI..."
+        ></textarea>
+
+        <div class="attachment-row">
+          <button id="captureBtn">Select area</button>
+          <div id="attachmentPreview" class="attachment-preview hidden">
+            <img id="attachmentImg" alt="Selected region" />
+            <button id="removeAttachment" title="Remove image">?</button>
+          </div>
+        </div>
+
+
+        <div class="actions">
+          <button id="clearBtn">Clear</button>
+          <button id="sendBtn">Send</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="snipOverlay" class="snip-overlay">
+      <img id="snipImage" class="snip-image" />
+      <div id="snipSelection" class="snip-selection"></div>
+      <div class="snip-hint">Click and drag to select. Release to capture. Ctrl+Alt+M to cancel.</div>
+    </div>
+
+    <script>
+      (function () {
+        try {
+          const input = document.getElementById("inputText");
+          const messages = document.getElementById("messages");
+          const sendBtn = document.getElementById("sendBtn");
+          const clearBtn = document.getElementById("clearBtn");
+          const captureBtn = document.getElementById("captureBtn");
+          const attachmentPreview = document.getElementById("attachmentPreview");
+          const attachmentImg = document.getElementById("attachmentImg");
+          const removeAttachment = document.getElementById("removeAttachment");
+          const minimizeBtn = document.getElementById("minimizeBtn");
+          const maximizeBtn = document.getElementById("maximizeBtn");
+          const closeBtn = document.getElementById("closeBtn");
+          const appEl = document.getElementById("app");
+          const snipOverlay = document.getElementById("snipOverlay");
+          const snipImage = document.getElementById("snipImage");
+          const snipSelection = document.getElementById("snipSelection");
+          const dragRegion = document.getElementById("dragRegion");
+          let appWindow = null;
+          try {
+            appWindow =
+              window.__TAURI__?.window?.getCurrent?.() ||
+              window.__TAURI__?.window?.getCurrentWindow?.() ||
+              window.__TAURI__?.window?.appWindow ||
+              null;
+          } catch (err) {
+            console.warn("No Tauri window handle", err);
+            appWindow = null;
+          }
+
+          let selectedImageBase64 = null;
+          let snipping = false;
+          let snipRestoreTimer = null;
+          let snipImageLoaded = false;
+          let wasFullscreen = false;
+          let wasMaximized = false;
+          let prevSize = null;
+          let prevPosition = null;
+          let prevBodyBg = "";
+          let prevHtmlBg = "";
+          let startX = 0;
+          let startY = 0;
+          let endX = 0;
+          let endY = 0;
+          let selecting = false;
+          const BACKEND_URL = (window.__BACKEND_URL || "http://127.0.0.1:3000").replace(
+            /\/$/,
+            ""
+          );
+
+          const logToTerminal = (msg) => {
+            if (window.__TAURI__?.core?.invoke) {
+              try {
+                window.__TAURI__.core.invoke("log_frontend", { message: msg });
+              } catch (_) {}
+            }
+          };
+
+          // Fixed acrylic look
+          function applyAcrylic() {
+            if (!appEl) return;
+            const blurVal = "14px";
+            const saturation = 1.15;
+            const bg = "rgba(15, 23, 42, 0.28)";
+            const border = "1px solid rgba(255, 255, 255, 0.15)";
+            appEl.style.background = bg;
+            appEl.style.border = border;
+            appEl.style.backdropFilter = `blur(${blurVal}) saturate(${saturation})`;
+            appEl.style.webkitBackdropFilter = `blur(${blurVal}) saturate(${saturation})`;
+          }
+          applyAcrylic();
+
+          const typesetBubble = (el) => {
+            if (window.MathJax?.typesetPromise && el) {
+              window.MathJax.typesetPromise([el]).catch((err) => {
+                logToTerminal(`mathjax error ${err}`);
+              });
+            }
+          };
+
+          // Window controls (Tauri if available, fallback to browser)
+          if (minimizeBtn) {
+            minimizeBtn.addEventListener("click", async () => {
+              try {
+                if (appWindow?.minimize) {
+                  await appWindow.minimize();
+                } else {
+                  window.blur();
+                }
+              } catch (err) {
+                logToTerminal(`ui: minimize failed ${err}`);
+              }
+            });
+          }
+
+          if (maximizeBtn) {
+            maximizeBtn.addEventListener("click", async () => {
+              try {
+                if (appWindow) {
+                  const isMax = appWindow.isMaximized ? await appWindow.isMaximized() : false;
+                  if (isMax && appWindow.unmaximize) {
+                    await appWindow.unmaximize();
+                  } else if (appWindow.maximize) {
+                    await appWindow.maximize();
+                  }
+                } else {
+                window.moveTo(0, 0);
+                window.resizeTo(screen.availWidth, screen.availHeight);
+              }
+            } catch (err) {
+                logToTerminal(`ui: maximize failed ${err}`);
+              }
+            });
+            }
+
+          if (closeBtn) {
+            closeBtn.addEventListener("click", async () => {
+              try {
+                if (appWindow?.close) {
+                  await appWindow.close();
+              } else {
+                window.close();
+              }
+            } catch (err) {
+              logToTerminal(`ui: close failed ${err}`);
+            }
+          });
+          }
+
+          // Restore main window after snip/cancel
+          function restoreApp() {
+            snipping = false;
+            if (snipRestoreTimer) {
+              clearTimeout(snipRestoreTimer);
+              snipRestoreTimer = null;
+            }
+            if (appEl) {
+              appEl.style.visibility = "visible";
+            }
+            if (appWindow?.show) {
+              appWindow.show().catch(() => {});
+            }
+            if (appWindow?.setFocus) {
+              appWindow.setFocus().catch(() => {});
+            }
+          }
+
+          // Safety: in case overlay fails, auto-restore after timeout
+          function armRestoreTimeout() {
+            if (snipRestoreTimer) return;
+            snipRestoreTimer = setTimeout(() => {
+              if (snipping) {
+                restoreApp();
+              }
+            }, 12000); // safety: don't leave window hidden if overlay fails
+          }
+
+          // Return from overlay to normal window, restoring size/pos
+          function showMainFromOverlay() {
+            snipping = false;
+            selecting = false;
+            if (snipRestoreTimer) {
+              clearTimeout(snipRestoreTimer);
+              snipRestoreTimer = null;
+            }
+            // restore backgrounds
+            document.body.style.backgroundColor = prevBodyBg;
+            document.documentElement.style.backgroundColor = prevHtmlBg;
+            if (appEl) {
+              appEl.style.visibility = "visible";
+            }
+            if (snipOverlay) {
+              snipOverlay.classList.remove("active");
+            }
+            if (dragRegion) {
+              dragRegion.style.display = "block";
+            }
+            (async () => {
+              try {
+                if (appWindow?.setFullscreen) {
+                  await appWindow.setFullscreen(false);
+                }
+                if (wasFullscreen && appWindow?.setFullscreen) {
+                  await appWindow.setFullscreen(true);
+                } else if (wasMaximized && appWindow?.maximize) {
+                  await appWindow.maximize();
+                } else {
+                  if (prevSize && appWindow?.setSize) {
+                    await appWindow.setSize({
+                      width: Math.round(prevSize.width),
+                      height: Math.round(prevSize.height),
+                    });
+                  }
+                  if (prevPosition && appWindow?.setPosition) {
+                    await appWindow.setPosition({
+                      x: Math.round(prevPosition.x),
+                      y: Math.round(prevPosition.y),
+                    });
+                  }
+                }
+                if (appWindow?.show) {
+                  await appWindow.show();
+                }
+              } catch (err) {
+                logToTerminal(`ui: restore failed ${err}`);
+              }
+            })();
+          }
+
+          function showAttachmentPreview(dataUrl) {
+            attachmentImg.src = dataUrl;
+            attachmentPreview.classList.remove("hidden");
+          }
+
+          function clearAttachment() {
+            selectedImageBase64 = null;
+            attachmentImg.src = "";
+            attachmentPreview.classList.add("hidden");
+          }
+
+          removeAttachment.addEventListener("click", clearAttachment);
+
+          // Send current text/image to backend and render bubbles
+          async function sendMessage() {
+            const text = input.value.trim();
+            if (!text && !selectedImageBase64) return;
+            let failed = false;
+
+            // User bubble
+            const userBubble = document.createElement("div");
+            userBubble.className = "bubble user";
+            const userText = document.createElement("div");
+            userText.textContent = text || "(Screenshot)";
+            userBubble.appendChild(userText);
+            if (selectedImageBase64) {
+              const thumb = document.createElement("img");
+              thumb.className = "thumb";
+              thumb.src = selectedImageBase64;
+              userBubble.appendChild(thumb);
+            }
+            messages.appendChild(userBubble);
+            messages.scrollTop = messages.scrollHeight;
+            typesetBubble(userBubble);
+            input.value = "";
+
+            // Temporary AI bubble
+            const aiBubble = document.createElement("div");
+            aiBubble.className = "bubble ai";
+            const aiText = document.createElement("span");
+            aiText.textContent = "Thinking";
+            const loader = document.createElement("img");
+            loader.src = "assets/loading.gif";
+            loader.alt = "Loading";
+            loader.className = "loading-gif";
+            aiBubble.appendChild(aiText);
+            aiBubble.appendChild(loader);
+            messages.appendChild(aiBubble);
+            messages.scrollTop = messages.scrollHeight;
+
+            try {
+              const payloadImage =
+                selectedImageBase64 && selectedImageBase64.includes(",")
+                  ? selectedImageBase64.split(",")[1]
+                  : selectedImageBase64 || null;
+
+              const res = await fetch(`${BACKEND_URL}/analyze-screenshot`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  message: text || null,
+                  imageBase64: payloadImage,
+                }),
+              });
+
+              if (!res.ok) {
+                throw new Error(`HTTP ${res.status}`);
+              }
+
+              const data = await res.json();
+              aiText.textContent = data.feedback || "(no response)";
+              loader.remove();
+            } catch (err) {
+              failed = true;
+              console.error("Backend error:", err);
+              aiText.textContent = `Backend error: ${err.message || err}`;
+              loader.remove();
+            } finally {
+              messages.scrollTop = messages.scrollHeight;
+              if (!failed) {
+                clearAttachment();
+              }
+              typesetBubble(aiBubble);
+            }
+          }
+
+          sendBtn?.addEventListener("click", sendMessage);
+          input?.addEventListener("keydown", (e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              sendMessage();
+            }
+          });
+
+          // Clear all bubbles and attachments
+          clearBtn?.addEventListener("click", () => {
+            messages.innerHTML = "";
+            clearAttachment();
+          });
+
+          // Update selection rectangle while dragging
+          function updateSelection(x, y) {
+            if (!snipSelection) return;
+            snipSelection.style.display = "block";
+            snipSelection.style.left = `${Math.min(startX, x)}px`;
+            snipSelection.style.top = `${Math.min(startY, y)}px`;
+            snipSelection.style.width = `${Math.abs(x - startX)}px`;
+            snipSelection.style.height = `${Math.abs(y - startY)}px`;
+          }
+
+          function hideSelection() {
+            if (snipSelection) {
+              snipSelection.style.display = "none";
+            }
+          }
+
+          async function enterSnipOverlay() {
+            try {
+              if (!window.__TAURI__?.core?.invoke) {
+                throw new Error("Tauri API not available");
+              }
+              logToTerminal("ui: capture button clicked");
+
+              // snapshot window state
+              try {
+                wasFullscreen = appWindow?.isFullscreen ? await appWindow.isFullscreen() : false;
+              } catch (_) {
+                wasFullscreen = false;
+              }
+              try {
+                wasMaximized = appWindow?.isMaximized ? await appWindow.isMaximized() : false;
+              } catch (_) {
+                wasMaximized = false;
+              }
+              try {
+                prevSize = appWindow?.outerSize ? await appWindow.outerSize() : null;
+              } catch (_) {
+                prevSize = null;
+              }
+              try {
+                prevPosition = appWindow?.outerPosition ? await appWindow.outerPosition() : null;
+              } catch (_) {
+                prevPosition = null;
+              }
+
+              // hide to avoid capturing the UI
+              if (appWindow?.hide) {
+                await appWindow.hide();
+              }
+              await new Promise((r) => setTimeout(r, 140));
+
+              const dataUrl = await window.__TAURI__.core.invoke("capture_fullscreen");
+              if (!dataUrl) {
+                throw new Error("No screenshot data");
+              }
+
+              // show window fullscreen for overlay
+              if (appWindow?.show) {
+                await appWindow.show();
+              }
+              if (appWindow?.setFullscreen) {
+                await appWindow.setFullscreen(true);
+              }
+              if (appEl) {
+                appEl.style.visibility = "hidden";
+              }
+              if (dragRegion) {
+                dragRegion.style.display = "none";
+              }
+              // Darken backgrounds so only overlay/screenshot is visible
+              prevBodyBg = document.body.style.backgroundColor;
+              prevHtmlBg = document.documentElement.style.backgroundColor;
+              document.body.style.backgroundColor = "rgba(0,0,0,0)";
+              document.documentElement.style.backgroundColor = "rgba(0,0,0,0)";
+              snipping = true;
+              armRestoreTimeout();
+
+              snipImageLoaded = false;
+              snipImage.src = dataUrl;
+              snipImage.onload = () => {
+                snipImageLoaded = true;
+              };
+              snipImage.onerror = () => {
+                logToTerminal("ui: snip image load error");
+              };
+              snipOverlay.classList.add("active");
+            } catch (err) {
+              logToTerminal(`ui: capture error ${err}`);
+              showMainFromOverlay();
+            }
+          }
+
+          function cancelSnipOverlay() {
+            hideSelection();
+            showMainFromOverlay();
+          }
+
+          async function finalizeSelection() {
+            if (!snipImageLoaded || !snipImage) return;
+            const rect = snipImage.getBoundingClientRect();
+            const width = Math.abs(endX - startX);
+            const height = Math.abs(endY - startY);
+            if (width < 5 || height < 5) {
+              hideSelection();
+              return;
+            }
+
+            const selLeft = Math.max(Math.min(startX, endX), rect.left);
+            const selTop = Math.max(Math.min(startY, endY), rect.top);
+            const selRight = Math.min(Math.max(startX, endX), rect.right);
+            const selBottom = Math.min(Math.max(startY, endY), rect.bottom);
+            const selWidth = selRight - selLeft;
+            const selHeight = selBottom - selTop;
+            if (selWidth <= 0 || selHeight <= 0) {
+              hideSelection();
+              return;
+            }
+
+            const scaleX = snipImage.naturalWidth / rect.width;
+            const scaleY = snipImage.naturalHeight / rect.height;
+            const sx = (selLeft - rect.left) * scaleX;
+            const sy = (selTop - rect.top) * scaleY;
+            const sw = selWidth * scaleX;
+            const sh = selHeight * scaleY;
+
+            const canvas = document.createElement("canvas");
+            canvas.width = Math.round(sw);
+            canvas.height = Math.round(sh);
+            const ctx = canvas.getContext("2d");
+            ctx.drawImage(
+              snipImage,
+              sx,
+              sy,
+              sw,
+              sh,
+              0,
+              0,
+              canvas.width,
+              canvas.height
+            );
+            selectedImageBase64 = canvas.toDataURL("image/png");
+            hideSelection();
+            showAttachmentPreview(selectedImageBase64);
+            showMainFromOverlay();
+          }
+
+          captureBtn?.addEventListener("click", enterSnipOverlay);
+
+          snipOverlay?.addEventListener("mousedown", (e) => {
+            if (!snipImageLoaded) return;
+            const rect = snipImage.getBoundingClientRect();
+            const clampX = Math.min(Math.max(e.clientX, rect.left), rect.right);
+            const clampY = Math.min(Math.max(e.clientY, rect.top), rect.bottom);
+            selecting = true;
+            startX = clampX;
+            startY = clampY;
+            updateSelection(clampX, clampY);
+          });
+
+          snipOverlay?.addEventListener("mousemove", (e) => {
+            if (!selecting || !snipImageLoaded) return;
+            const rect = snipImage.getBoundingClientRect();
+            const clampX = Math.min(Math.max(e.clientX, rect.left), rect.right);
+            const clampY = Math.min(Math.max(e.clientY, rect.top), rect.bottom);
+            updateSelection(clampX, clampY);
+          });
+
+          snipOverlay?.addEventListener("mouseup", async (e) => {
+            if (!selecting || !snipImageLoaded) return;
+            selecting = false;
+            const rect = snipImage.getBoundingClientRect();
+            endX = Math.min(Math.max(e.clientX, rect.left), rect.right);
+            endY = Math.min(Math.max(e.clientY, rect.top), rect.bottom);
+            await finalizeSelection();
+          });
+
+          window.addEventListener("keydown", (e) => {
+            const key = typeof e.key === "string" ? e.key.toLowerCase() : "";
+            if (key === "m" && e.ctrlKey && e.altKey) {
+              if (selecting) {
+                selecting = false;
+              }
+              cancelSnipOverlay();
+            }
+          });
+
+          // Receive cropped image from overlay
+          if (window.__TAURI__ && window.__TAURI__.event) {
+            window.__TAURI__.event.listen("snip-complete", ({ payload }) => {
+              logToTerminal("ui: snip-complete event received");
+              restoreApp();
+              if (payload) {
+                selectedImageBase64 = payload;
+                showAttachmentPreview(payload);
+              }
+            });
+
+            window.__TAURI__.event.listen("snip-cancel", () => {
+              logToTerminal("ui: snip-cancel event received");
+              restoreApp();
+            });
+          }
+
+          // If Tauri isn't available, avoid breaking the page.
+          if (!window.__TAURI__) {
+            console.warn("Tauri API not detected; window controls and capture disabled.");
+          }
+        } catch (err) {
+          console.error("Init error:", err);
+        }
+      })();
+    </script>
+  </body>
+</html>

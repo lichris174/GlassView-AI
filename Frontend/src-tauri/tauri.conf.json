@@ -1,0 +1,56 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+
+  "productName": "AI Screen Assistant",
+  "version": "0.1.0",
+  "identifier": "com.tauri.ai-screen-assistant",
+
+  "build": {
+    "frontendDist": "..",
+    "beforeDevCommand": "",
+    "beforeBuildCommand": ""
+  },
+
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "GlassView AI",
+        "width": 900,
+        "height": 650,
+        "transparent": true,
+        "decorations": false,
+        "resizable": true,
+        "shadow": false,
+        "fullscreen": false,
+        "visible": true,
+        "backgroundColor": "#00000000"
+      },
+      {
+        "label": "snip-overlay",
+        "title": "Snip Overlay",
+        "width": 800,
+        "height": 600,
+        "transparent": false,
+        "decorations": false,
+        "resizable": false,
+        "visible": false,
+        "fullscreen": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "backgroundColor": "#000000"
+      }
+    ]
+  },
+
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.icns",
+      "icons/icon.png"
+    ]
+  }
+}

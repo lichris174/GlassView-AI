@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <!-- Overlay window used for snip selection -->
+  <style>
+    /* Fullscreen darkened backdrop */
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: rgba(0, 0, 0, 0.65);
+      cursor: crosshair;
+      user-select: none;
+    }
+    /* Container that holds the screenshot and selection */
+    #container {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.55);
+      cursor: crosshair;
+    }
+    /* Frame that fills the screen */
+    #frame {
+      position: fixed;
+      inset: 0;
+    }
+    /* Screenshot image */
+    #img {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      border-radius: 8px;
+      box-shadow: 0 12px 50px rgba(0,0,0,0.5);
+      user-select: none;
+      pointer-events: none;
+    }
+    /* Selection rectangle */
+    #selection {
+      position: absolute;
+      border: 2px solid #4af;
+      background: rgba(74, 175, 255, 0.2);
+      pointer-events: none;
+      display: none;
+    }
+    /* On-screen instructions */
+    #hint {
+      position: fixed;
+      top: 16px;
+      left: 16px;
+      padding: 8px 12px;
+      border-radius: 10px;
+      background: rgba(0, 0, 0, 0.55);
+      color: #e5e7eb;
+      font-size: 14px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      pointer-events: none;
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <div id="frame">
+      <img id="img" />
+      <div id="selection"></div>
+    </div>
+  </div>
+  <div id="hint">Click and drag to select. Release to capture. Ctrl+Alt+M to cancel.</div>
+  <script>
+    // Pull Tauri helpers if available
+    const { core, event } = window.__TAURI__ || {};
+    const img = document.getElementById("img");
+    const selection = document.getElementById("selection");
+    const frame = document.getElementById("frame");
+
+    let startX = 0;
+    let startY = 0;
+    let endX = 0;
+    let endY = 0;
+    let selecting = false;
+    let imageReady = false;
+
+    // Log messages to backend terminal for debugging
+    function logToTerminal(msg) {
+      if (core && core.invoke) {
+        try {
+          core.invoke("log_frontend", { message: msg });
+        } catch (_) {}
+      }
+    }
+
+    logToTerminal("overlay: script loaded");
+
+    // Mark image ready on load
+    img.addEventListener("load", () => {
+      imageReady = true;
+      window.focus();
+      logToTerminal("overlay: screenshot loaded");
+    });
+    img.addEventListener("error", () => {
+      logToTerminal("overlay: image load error");
+      cancelSnip();
+    });
+
+    async function cancelSnip() {
+      if (!core) return;
+      try {
+        selection.style.display = "none";
+        await core.invoke("cancel_snip");
+      } catch (err) {
+        logToTerminal(`overlay: cancel_snip error ${err}`);
+      }
+    }
+
+    // Draw the selection rectangle as the mouse moves
+    function updateSelection(x, y) {
+      selection.style.display = "block";
+      selection.style.left = `${Math.min(startX, x)}px`;
+      selection.style.top = `${Math.min(startY, y)}px`;
+      selection.style.width = `${Math.abs(x - startX)}px`;
+      selection.style.height = `${Math.abs(y - startY)}px`;
+    }
+
+    // Start dragging if the image is ready
+    window.addEventListener("mousedown", (e) => {
+      if (!imageReady) {
+        logToTerminal("overlay: mousedown ignored, image not ready");
+        return;
+      }
+      const rect = img.getBoundingClientRect();
+      const clampX = Math.min(Math.max(e.clientX, rect.left), rect.right);
+      const clampY = Math.min(Math.max(e.clientY, rect.top), rect.bottom);
+      selecting = true;
+      startX = clampX;
+      startY = clampY;
+      updateSelection(clampX, clampY);
+      logToTerminal(`overlay: drag start ${clampX},${clampY}`);
+    });
+
+    // Update rectangle during drag
+    window.addEventListener("mousemove", (e) => {
+      if (!selecting) return;
+      const rect = img.getBoundingClientRect();
+      const clampX = Math.min(Math.max(e.clientX, rect.left), rect.right);
+      const clampY = Math.min(Math.max(e.clientY, rect.top), rect.bottom);
+      updateSelection(clampX, clampY);
+    });
+
+    // Finish drag and send selection to backend
+    window.addEventListener("mouseup", async (e) => {
+      if (!selecting) return;
+      selecting = false;
+      const rect = img.getBoundingClientRect();
+      endX = Math.min(Math.max(e.clientX, rect.left), rect.right);
+      endY = Math.min(Math.max(e.clientY, rect.top), rect.bottom);
+
+      const width = Math.abs(endX - startX);
+      const height = Math.abs(endY - startY);
+      if (width < 5 || height < 5) {
+        selection.style.display = "none";
+        logToTerminal("overlay: selection too small");
+        return;
+      }
+
+      const selLeft = Math.max(Math.min(startX, endX), rect.left);
+      const selTop = Math.max(Math.min(startY, endY), rect.top);
+      const selRight = Math.min(Math.max(startX, endX), rect.right);
+      const selBottom = Math.min(Math.max(startY, endY), rect.bottom);
+      const selWidth = selRight - selLeft;
+      const selHeight = selBottom - selTop;
+
+      if (selWidth <= 0 || selHeight <= 0) {
+        selection.style.display = "none";
+        return;
+      }
+
+      try {
+        if (core) {
+          await core.invoke("finish_snip", {
+            x: selLeft - rect.left,
+            y: selTop - rect.top,
+            width: selWidth,
+            height: selHeight,
+            viewportW: rect.width,
+            viewportH: rect.height,
+          });
+        }
+        selection.style.display = "none";
+        logToTerminal(`overlay: finish_snip w=${selWidth} h=${selHeight}`);
+      } catch (err) {
+        logToTerminal(`overlay: finish_snip error ${err}`);
+        cancelSnip();
+      }
+    });
+
+    // Hotkey to cancel snip
+    window.addEventListener("keydown", (e) => {
+      const key = typeof e.key === "string" ? e.key.toLowerCase() : "";
+      if (key === "m" && e.ctrlKey && e.altKey) {
+        e.preventDefault();
+        logToTerminal("overlay: hotkey ctrl+alt+m -> cancel");
+        cancelSnip();
+      }
+    });
+
+    // On load, request the stored screenshot from native.
+    (async () => {
+      try {
+        if (core) {
+          logToTerminal("overlay: requesting get_snip_image");
+          const dataUrl = await core.invoke("get_snip_image");
+          if (!dataUrl) {
+            throw new Error("No screenshot data");
+          }
+          img.src = dataUrl;
+          window.focus();
+        }
+      } catch (err) {
+        logToTerminal(`overlay: get_snip_image error ${err}`);
+        const hint = document.getElementById("hint");
+        if (hint) {
+          hint.textContent = "Screenshot failed. Press Ctrl+Alt+M to close.";
+        }
+        // Still allow cancel via hotkey.
+      }
+    })();
+  </script>
+</body>
+</html>
