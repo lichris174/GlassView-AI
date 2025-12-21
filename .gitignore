@@ -1,0 +1,3 @@
+# .gitignore: exclude build artifacts and dependency folders.
+node_modules/
+Frontend/src-tauri/target/
