@@ -1,14 +1,13 @@
 {
-  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-
-  "productName": "AI Screen Assistant",
-  "version": "0.1.0",
-  "identifier": "com.tauri.ai-screen-assistant",
+  "productName": "GlassView",
+  "version": "0.2.0",
+  "identifier": "dev.glassview.app",
 
   "build": {
-    "frontendDist": "..",
-    "beforeDevCommand": "",
-    "beforeBuildCommand": ""
+    "frontendDist": "../ui/dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm --prefix ../ui run dev",
+    "beforeBuildCommand": "npm --prefix ../ui run build"
   },
 
   "app": {

@@ -1,0 +1,34 @@
+/* Glass material styling, kept in one place so the look can be swapped here. */
+.glass {
+  position: relative;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--glass-radius);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+
+.glass--capsule {
+  border-radius: 999px;
+  background: var(--glass-bg-strong);
+}
+
+/* Specular top highlight. */
+.glass__sheen {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(
+    180deg,
+    var(--glass-highlight) 0%,
+    transparent 22%
+  );
+  opacity: 0.7;
+}
+
+.glass__content {
+  position: relative;
+  height: 100%;
+}

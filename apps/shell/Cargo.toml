@@ -1,17 +1,21 @@
 [package]
-name = "app"
-version = "0.1.0"
-description = "AI Screen Assistant"
-authors = ["you"]
-license = ""
-repository = ""
+name = "glassview-shell"
+version = "0.2.0"
+description = "GlassView native shell"
+authors = ["GlassView"]
+license = "MIT"
 edition = "2021"
+
+[[bin]]
+name = "glassview"
+path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["image-png"] }
+tauri-plugin-global-shortcut = "2"
 windows = { version = "0.58", features = [
   "Win32_UI_WindowsAndMessaging", 
   "Win32_Graphics_Dwm", 

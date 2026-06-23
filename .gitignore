@@ -1,3 +1,25 @@
-# .gitignore: exclude build artifacts and dependency folders.
+# Dependencies
 node_modules/
-Frontend/src-tauri/target/
+
+# Rust / Tauri build artifacts
+apps/shell/target/
+apps/shell/gen/schemas/
+
+# Python
+apps/server/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local data (chat history DB)
+apps/server/glassview.db
+*.db
+
+# Frontend build
+apps/ui/dist/
+
+# Editor / OS
+.DS_Store
+Thumbs.db

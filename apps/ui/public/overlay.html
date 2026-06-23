@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Snip</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { width: 100%; height: 100%; overflow: hidden; cursor: crosshair; }
+      #shot { position: fixed; inset: 0; width: 100vw; height: 100vh; user-select: none; -webkit-user-drag: none; }
+      #dim { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45); }
+      #sel {
+        position: fixed; border: 1.5px solid #7aa2ff;
+        background: rgba(122, 162, 255, 0.12);
+        box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45);
+        display: none;
+      }
+      #hint {
+        position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+        color: #fff; font: 13px system-ui; background: rgba(0,0,0,0.6);
+        padding: 6px 12px; border-radius: 999px;
+      }
+    </style>
+  </head>
+  <body>
+    <img id="shot" alt="" />
+    <div id="dim"></div>
+    <div id="sel"></div>
+    <div id="hint">Drag to select. Press Esc to cancel.</div>
+    <script>
+      const invoke = window.__TAURI__.core.invoke;
+      const shot = document.getElementById("shot");
+      const dim = document.getElementById("dim");
+      const sel = document.getElementById("sel");
+
+      invoke("get_snip_image").then((url) => { shot.src = url; }).catch(() => {});
+
+      let startX = 0, startY = 0, dragging = false;
+
+      window.addEventListener("mousedown", (e) => {
+        dragging = true;
+        startX = e.clientX;
+        startY = e.clientY;
+        dim.style.display = "none";
+        sel.style.display = "block";
+        update(e);
+      });
+      window.addEventListener("mousemove", (e) => { if (dragging) update(e); });
+      window.addEventListener("mouseup", (e) => {
+        if (!dragging) return;
+        dragging = false;
+        const x = Math.min(startX, e.clientX);
+        const y = Math.min(startY, e.clientY);
+        const w = Math.abs(e.clientX - startX);
+        const h = Math.abs(e.clientY - startY);
+        invoke("finish_snip", {
+          x, y, width: w, height: h,
+          viewportW: window.innerWidth, viewportH: window.innerHeight,
+        }).catch(() => {});
+      });
+      window.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") invoke("cancel_snip").catch(() => {});
+      });
+
+      function update(e) {
+        const x = Math.min(startX, e.clientX);
+        const y = Math.min(startY, e.clientY);
+        sel.style.left = x + "px";
+        sel.style.top = y + "px";
+        sel.style.width = Math.abs(e.clientX - startX) + "px";
+        sel.style.height = Math.abs(e.clientY - startY) + "px";
+      }
+    </script>
+  </body>
+</html>
