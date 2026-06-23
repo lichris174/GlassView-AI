@@ -12,6 +12,12 @@ export default defineConfig({
   build: {
     outDir: "dist",
     target: "es2021",
+    rollupOptions: {
+      input: {
+        main: "index.html",
+        preview: "preview.html",
+      },
+    },
   },
   test: {
     environment: "jsdom",

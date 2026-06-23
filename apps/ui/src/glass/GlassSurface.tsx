@@ -23,6 +23,7 @@ export function GlassSurface({
   return (
     <div className={`glass glass--${variant} ${className}`} style={style}>
       <div className="glass__sheen" aria-hidden />
+      <div className="glass__grain" aria-hidden />
       <div className="glass__content">{children}</div>
     </div>
   );

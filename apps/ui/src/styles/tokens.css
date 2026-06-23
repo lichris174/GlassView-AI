@@ -4,23 +4,28 @@
  * rather than every component.
  */
 :root {
-  /* surface / glass */
-  --glass-bg: rgba(22, 24, 30, 0.55);
-  --glass-bg-strong: rgba(28, 30, 38, 0.72);
-  --glass-border: rgba(255, 255, 255, 0.12);
-  --glass-highlight: rgba(255, 255, 255, 0.18);
-  --glass-blur: 24px;
-  --glass-saturate: 160%;
-  --glass-radius: 16px;
+  /* glass material (tunable at runtime via the preview slider) */
+  --glass-blur: 22px;
+  --glass-saturate: 175%;
+  --glass-brightness: 1.06;
+  --glass-tint: rgba(20, 22, 30, 0.45);
+  --glass-tint-strong: rgba(24, 26, 36, 0.62);
+  --glass-border: rgba(255, 255, 255, 0.16);
+  --glass-border-top: rgba(255, 255, 255, 0.34);
+  --glass-sheen: rgba(255, 255, 255, 0.22);
+  --glass-grain: 0.035;
+  --glass-radius: 18px;
+  --glass-shadow: 0 10px 40px rgba(0, 0, 0, 0.45);
+  --glass-text-scrim: rgba(8, 9, 12, 0.28);
 
   /* text */
-  --fg: rgba(244, 246, 250, 0.95);
-  --fg-muted: rgba(244, 246, 250, 0.6);
-  --fg-faint: rgba(244, 246, 250, 0.4);
+  --fg: rgba(245, 247, 251, 0.96);
+  --fg-muted: rgba(245, 247, 251, 0.62);
+  --fg-faint: rgba(245, 247, 251, 0.4);
 
   /* accents */
   --accent: #7aa2ff;
-  --accent-soft: rgba(122, 162, 255, 0.16);
+  --accent-soft: rgba(122, 162, 255, 0.18);
   --danger: #ff6b6b;
 
   /* layout */
@@ -31,4 +36,13 @@
   --space-5: 24px;
   --font-sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, "Cascadia Code", "JetBrains Mono", monospace;
+}
+
+/* Users who prefer less transparency get a solid surface instead of glass. */
+@media (prefers-reduced-transparency: reduce) {
+  :root {
+    --glass-tint: rgba(20, 22, 30, 0.96);
+    --glass-tint-strong: rgba(24, 26, 36, 0.98);
+    --glass-grain: 0;
+  }
 }
