@@ -33,6 +33,9 @@ def client(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[TestClient]:
     with TestClient(app) as c:
         yield c
     os.unlink(tmp.name)
+    mem = f"{tmp.name}.memories.db"
+    if os.path.exists(mem):
+        os.unlink(mem)
 
 
 def test_health(client: TestClient) -> None:
@@ -65,6 +68,21 @@ def test_streaming_chat_persists(client: TestClient) -> None:
     assert [m["role"] for m in detail["messages"]] == ["user", "assistant"]
     assert detail["messages"][1]["content"] == "Hello world"
     assert detail["title"] == "hi"
+
+
+def test_chat_turn_is_recalled(client: TestClient) -> None:
+    """A completed turn lands in memory and is retrievable via /recall."""
+    cid = "chat_recall_1"
+    with client.stream(
+        "POST", "/chat",
+        json={"chat_id": cid, "message": "why is postgres refusing connections"},
+    ) as r:
+        "".join(r.iter_text())
+
+    hits = client.get("/recall", params={"q": "postgres connection", "k": 3}).json()["hits"]
+    assert hits
+    assert "postgres" in hits[0]["text"].lower()
+    assert hits[0]["meta"]["chat_id"] == cid
 
 
 def test_stream_error_is_surfaced(
