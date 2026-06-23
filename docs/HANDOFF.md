@@ -70,11 +70,21 @@ The server auto-detects the installed tag; no env override needed.
 2. Apple liquid glass (real lensing/refraction): WebGL shader sampling a
    backdrop texture; HUD overlay feeds the screen capture as that texture.
    Swap happens inside `src/glass/` only.
-3. Applied-AI spine: OCR fusion, tool-use loop, RAG memory (sqlite-vec),
-   privacy redaction, model routing. Eval harness DONE: `glassview_ai/evals/`
-   (model-agnostic scorer + `run_eval` + live Ollama runner), golden set at
-   `evals/golden/cases.json`, `make eval` target, 6 tests. 10 server tests +
-   ruff green.
+3. Applied-AI spine: DONE as standalone, offline-tested modules (30 server
+   tests, ruff green). Still UNWIRED into the `/chat` route and the UI.
+   - `glassview_ai/evals/` - scorer + `run_eval` + live Ollama runner, golden
+     set at `evals/golden/cases.json`, `make eval` target.
+   - `glassview_ai/privacy/` - `redact()` masks secrets/PII (used by RAG add).
+   - `glassview_ai/routing/` - `route()` fast vs strong model by prompt/image.
+   - `glassview_ai/agents/` - bounded tool-use loop + `ToolRegistry` (tools are
+     stubs/injectable; real clipboard/crop tools need Tauri wiring).
+   - `glassview_ai/rag/` - sqlite-vec `MemoryStore` + pluggable embedder
+     (offline `HashEmbedder`, `OllamaEmbedder` for quality).
+   - `glassview_ai/ocr/` - Tesseract extract (graceful if binary absent; not
+     installed here) + `fuse_prompt`.
+   Next: wire spine into `/chat` (OCR fuse -> route -> optional agent loop ->
+   persist+redact into RAG), expose `/recall`, add real agent tools via Tauri,
+   and add image golden cases (Pillow now installed, can synthesize fixtures).
 4. Done: the `POST /chat` empty-body bug. Two causes. (a) `config` bound
    `DB_PATH`/`OLLAMA_HOST` from env at import time, so the launcher's and the
    tests' `GLASSVIEW_DB` override was ignored; `load_settings`/`detect_model`
