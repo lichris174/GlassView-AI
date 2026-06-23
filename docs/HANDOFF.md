@@ -71,7 +71,10 @@ The server auto-detects the installed tag; no env override needed.
    backdrop texture; HUD overlay feeds the screen capture as that texture.
    Swap happens inside `src/glass/` only.
 3. Applied-AI spine: OCR fusion, tool-use loop, RAG memory (sqlite-vec),
-   privacy redaction, eval harness, model routing.
+   privacy redaction, model routing. Eval harness DONE: `glassview_ai/evals/`
+   (model-agnostic scorer + `run_eval` + live Ollama runner), golden set at
+   `evals/golden/cases.json`, `make eval` target, 6 tests. 10 server tests +
+   ruff green.
 4. Done: the `POST /chat` empty-body bug. Two causes. (a) `config` bound
    `DB_PATH`/`OLLAMA_HOST` from env at import time, so the launcher's and the
    tests' `GLASSVIEW_DB` override was ignored; `load_settings`/`detect_model`
