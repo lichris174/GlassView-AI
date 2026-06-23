@@ -65,3 +65,26 @@ def test_streaming_chat_persists(client: TestClient) -> None:
     assert [m["role"] for m in detail["messages"]] == ["user", "assistant"]
     assert detail["messages"][1]["content"] == "Hello world"
     assert detail["title"] == "hi"
+
+
+def test_stream_error_is_surfaced(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An Ollama failure mid-stream must reach the client, not vanish as an
+    empty 200 body, and the failed turn must still be recorded."""
+
+    async def boom(self, messages, *, temperature=0.2):  # noqa: ANN001
+        raise RuntimeError("Ollama HTTP 404: model not found")
+        yield  # pragma: no cover - makes this an async generator
+
+    monkeypatch.setattr(OllamaClient, "stream_chat", boom)
+
+    cid = "chat_err_1"
+    with client.stream("POST", "/chat", json={"chat_id": cid, "message": "hi"}) as r:
+        body = "".join(chunk for chunk in r.iter_text())
+    assert "[error]" in body
+    assert "404" in body
+
+    detail = client.get(f"/chats/{cid}").json()
+    assert [m["role"] for m in detail["messages"]] == ["user", "assistant"]
+    assert "[error]" in detail["messages"][1]["content"]

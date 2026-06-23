@@ -119,12 +119,19 @@ async def chat(req: ChatRequest) -> StreamingResponse:
 
     async def event_stream() -> AsyncIterator[bytes]:
         answer_parts: list[str] = []
+        error: str | None = None
         try:
             async for chunk in ollama.stream_chat(messages):
                 answer_parts.append(chunk)
                 yield chunk.encode("utf-8")
+        except Exception as exc:  # noqa: BLE001
+            # The 200 header is already sent, so a raised error would otherwise
+            # reach the client as a silent empty body. Surface it in the stream
+            # instead, and record it so the failed turn is not lost.
+            error = f"[error] {exc}"
+            yield error.encode("utf-8")
         finally:
-            answer = "".join(answer_parts) or "(no response)"
+            answer = "".join(answer_parts) or error or "(no response)"
             # Persist the turn (store the image only on the message that introduced it).
             await store.add_message(
                 req.chat_id, "user", req.message or "",

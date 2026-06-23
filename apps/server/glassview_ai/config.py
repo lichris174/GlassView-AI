@@ -13,16 +13,19 @@ from dataclasses import dataclass
 
 import httpx
 
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
+DEFAULT_DB_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "glassview.db"
+)
+
+# Env is read at call time (see load_settings / detect_model), not bound here at
+# import: binding at import froze the values before tests or the launcher could
+# set GLASSVIEW_DB / OLLAMA_HOST, so overrides were silently ignored.
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
 
 # Preference order when several vision tags are installed. We prefer instruct
 # tunes, then any qwen3-vl, then any model the user explicitly named.
 _VISION_PREFERENCES = ("qwen3-vl",)
-
-DB_PATH = os.environ.get(
-    "GLASSVIEW_DB",
-    os.path.join(os.path.dirname(os.path.dirname(__file__)), "glassview.db"),
-)
 
 MAX_HISTORY_TURNS = 12  # user/assistant pairs kept as rolling context
 
@@ -58,12 +61,13 @@ def _list_installed_models(host: str) -> list[str]:
     return [m.get("name", "") for m in data.get("models", []) if m.get("name")]
 
 
-def detect_model(host: str = OLLAMA_HOST, override: str | None = None) -> str:
+def detect_model(host: str | None = None, override: str | None = None) -> str:
     """Pick the model to use.
 
     Order: explicit override (env ``OLLAMA_MODEL`` or arg) if installed, else a
     preferred vision family (instruct first), else raise with guidance.
     """
+    host = host or os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
     override = override or os.environ.get("OLLAMA_MODEL")
     installed = _list_installed_models(host)
 
@@ -97,8 +101,9 @@ def detect_model(host: str = OLLAMA_HOST, override: str | None = None) -> str:
 
 
 def load_settings() -> Settings:
+    host = os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
     return Settings(
-        ollama_host=OLLAMA_HOST,
-        model=detect_model(OLLAMA_HOST),
-        db_path=DB_PATH,
+        ollama_host=host,
+        model=detect_model(host),
+        db_path=os.environ.get("GLASSVIEW_DB", DEFAULT_DB_PATH),
     )

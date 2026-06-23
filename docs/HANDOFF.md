@@ -72,10 +72,15 @@ The server auto-detects the installed tag; no env override needed.
    Swap happens inside `src/glass/` only.
 3. Applied-AI spine: OCR fusion, tool-use loop, RAG memory (sqlite-vec),
    privacy redaction, eval harness, model routing.
-4. Bug: a live `POST /chat` turn returned an empty body and persisted no
-   messages (real Ollama path; faked-Ollama tests pass). Investigate
-   `ollama_client.stream_chat` / the `event_stream` generator before wiring AI
-   into the UI.
+4. Done: the `POST /chat` empty-body bug. Two causes. (a) `config` bound
+   `DB_PATH`/`OLLAMA_HOST` from env at import time, so the launcher's and the
+   tests' `GLASSVIEW_DB` override was ignored; `load_settings`/`detect_model`
+   now read env at call time, and the test suite is properly isolated (was
+   silently appending to a real `glassview.db`). (b) an Ollama error raised
+   mid-stream after the 200 header reached the client as a silent empty body;
+   `event_stream` now catches it, emits `[error] ...` into the stream, and
+   persists the failed turn. A regression test covers the error path. Next live
+   run will show the real Ollama error string if one occurs.
 
 Build order preference: finish the UI (glass + snip) before wiring AI.
 
