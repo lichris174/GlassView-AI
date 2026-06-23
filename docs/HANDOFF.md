@@ -51,14 +51,22 @@ The server auto-detects the installed tag; no env override needed.
   all green.
 - Glass material: premium CSS frost (blur, saturate, brightness, specular,
   grain) with tunable tokens, plus a browser preview with live tuning sliders.
+- Snip overlay rebuilt as a React Vite entry (`apps/ui/overlay.html` +
+  `src/overlay/`), replacing the old vanilla `public/overlay.html` (deleted).
+  Freeze-frame, scrim fade-in (180ms), box-shadow punch-through to full
+  brightness, tabular W x H px badge, magnifier loupe with pixel color/coords,
+  keyboard nudge (arrows) / resize (shift+arrows) / Enter confirm / Esc cancel,
+  exit "lift" animation. Browser-previewable via a synthetic frame when not in
+  Tauri (open http://localhost:1420/overlay.html under `npm run dev`). Bridge
+  helpers added to `lib/tauri.ts` (getSnipImage/finishSnip/cancelSnip). Vite
+  rollup input now includes overlay. Build + typecheck + vitest green.
 
 ## Open / next
 
-1. Snip/capture overlay redesign (janky now, full redo). Needs Tauri to test.
-   Design spec: freeze-frame + dim scrim fade-in (~180ms), selection punches
-   through to full brightness, live W x H px badge with tabular figures,
-   magnifier loupe with pixel color/coords, keyboard nudge/resize, exit "lift"
-   toward app for continuity, multi-monitor aware (monitor under cursor).
+1. Snip overlay: runtime-verify under Tauri (`./dev.ps1`) - drag, loupe color
+   sampling, keyboard adjust, lift exit, crop accuracy. Then multi-monitor:
+   Rust still captures the primary screen (`Screen::from_point(0,0)`); make it
+   capture the monitor under the cursor and place the overlay window there.
 2. Apple liquid glass (real lensing/refraction): WebGL shader sampling a
    backdrop texture; HUD overlay feeds the screen capture as that texture.
    Swap happens inside `src/glass/` only.

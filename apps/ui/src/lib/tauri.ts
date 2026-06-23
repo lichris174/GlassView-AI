@@ -20,6 +20,31 @@ export async function startSnip(): Promise<void> {
   await invoke("start_snip");
 }
 
+/** Fetch the frozen screen capture for the snip overlay; null in browser. */
+export async function getSnipImage(): Promise<string | null> {
+  if (!isTauri()) return null;
+  return invoke<string>("get_snip_image");
+}
+
+/** Crop the capture to a region (CSS px, relative to the overlay viewport). */
+export async function finishSnip(rect: {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  viewportW: number;
+  viewportH: number;
+}): Promise<void> {
+  if (!isTauri()) return;
+  await invoke("finish_snip", rect);
+}
+
+/** Abort the current snip session and restore the main window. */
+export async function cancelSnip(): Promise<void> {
+  if (!isTauri()) return;
+  await invoke("cancel_snip");
+}
+
 /** Subscribe to a native event; returns an unlisten fn (no-op in browser). */
 export async function onNative<T>(
   event: "snip-complete" | "snip-cancel" | "snip-hotkey",
