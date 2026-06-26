@@ -1,0 +1,3739 @@
+From f1212589b741eb86cbbc4bbfad41a9afd4bb19a6 Mon Sep 17 00:00:00 2001
+From: lichris174 <lichris174@gmail.com>
+Date: Fri, 26 Jun 2026 14:40:24 -0400
+Subject: [PATCH] bugfix: address UI/app bugs from review
+
+- useChat: avoid empty user bubble on image-only sends; keep partial text on cancel
+- main.py: persist error message instead of partial response when streaming fails
+- useSettings/types: remove dead theme field (useTheme owns theme)
+- RegionSelect: window-level mouseup so releasing outside overlay finishes drag
+- HistoryPanel: refresh when visible prop becomes true
+- VoicePanel: surface speech recognition errors
+- ChatPanel: focus input once on mount instead of autoFocus on every render
+- SettingsPanel: type-safe boolean toggle helper
+- config.py: remove misleading module-level OLLAMA_HOST binding
+- main.py: reuse lifespan OllamaClient when routing picks default model
+- agents/loop: parse balanced JSON blocks instead of greedy regex
+- tauri.conf.json: disable resizing, add restrictive CSP
+- main.rs: propagate shortcut registration errors to frontend
+---
+ apps/desktop/src-tauri/src/main.rs            |   97 +
+ apps/desktop/src-tauri/tauri.conf.json        |   49 +
+ apps/desktop/src/App.tsx                      |  317 +++
+ apps/desktop/src/components/RegionSelect.tsx  |   90 +
+ .../src/components/panels/ChatPanel.tsx       |  138 ++
+ .../src/components/panels/HistoryPanel.tsx    |   72 +
+ .../src/components/panels/SettingsPanel.tsx   |  116 +
+ .../src/components/panels/VoicePanel.tsx      |   98 +
+ apps/desktop/src/hooks/useChat.ts             |   99 +
+ apps/desktop/src/hooks/useSettings.ts         |   49 +
+ apps/desktop/src/types.ts                     |   33 +
+ docs/AI_SCREEN_ASSISTANT_REVIEW.md            |  124 ++
+ docs/bugfix-patch-2026-06-26.patch            | 1858 +++++++++++++++++
+ glassview_ai/agents/loop.py                   |  126 ++
+ glassview_ai/config.py                        |  107 +
+ glassview_ai/main.py                          |  214 ++
+ 16 files changed, 3587 insertions(+)
+ create mode 100644 apps/desktop/src-tauri/src/main.rs
+ create mode 100644 apps/desktop/src-tauri/tauri.conf.json
+ create mode 100644 apps/desktop/src/App.tsx
+ create mode 100644 apps/desktop/src/components/RegionSelect.tsx
+ create mode 100644 apps/desktop/src/components/panels/ChatPanel.tsx
+ create mode 100644 apps/desktop/src/components/panels/HistoryPanel.tsx
+ create mode 100644 apps/desktop/src/components/panels/SettingsPanel.tsx
+ create mode 100644 apps/desktop/src/components/panels/VoicePanel.tsx
+ create mode 100644 apps/desktop/src/hooks/useChat.ts
+ create mode 100644 apps/desktop/src/hooks/useSettings.ts
+ create mode 100644 apps/desktop/src/types.ts
+ create mode 100644 docs/AI_SCREEN_ASSISTANT_REVIEW.md
+ create mode 100644 docs/bugfix-patch-2026-06-26.patch
+ create mode 100644 glassview_ai/agents/loop.py
+ create mode 100644 glassview_ai/config.py
+ create mode 100644 glassview_ai/main.py
+
+diff --git a/apps/desktop/src-tauri/src/main.rs b/apps/desktop/src-tauri/src/main.rs
+new file mode 100644
+index 0000000..3d3353a
+--- /dev/null
++++ b/apps/desktop/src-tauri/src/main.rs
+@@ -0,0 +1,97 @@
++#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
++
++//! GlassView native shell: a content-sized transparent always-on-top overlay window,
++//! a global toggle hotkey, a system tray, ownership of the Python backend sidecar, and
++//! the region-snip capture flow (a temporary fullscreen window).
++
++mod capture;
++mod sidecar;
++
++use tauri::{
++    menu::{MenuBuilder, MenuItemBuilder},
++    tray::TrayIconBuilder,
++    Emitter, Manager, RunEvent,
++};
++use tauri_plugin_global_shortcut::{Builder as GlobalShortcutBuilder, GlobalShortcutExt, ShortcutState};
++
++const DEFAULT_SHORTCUT: &str = "Ctrl+Shift+Space";
++
++fn main() {
++    tauri::Builder::default()
++        .plugin(GlobalShortcutBuilder::new().build())
++        .invoke_handler(tauri::generate_handler![
++            capture::log_frontend,
++            capture::capture_screen,
++            capture::arm_region_escape,
++            capture::disarm_region_escape,
++            register_shortcut,
++        ])
++        .setup(|app| {
++            sidecar::start();
++            if let Err(err) = register_hotkey(app.handle(), DEFAULT_SHORTCUT) {
++                eprintln!("[setup] default hotkey unavailable: {err}");
++            }
++            build_tray(app.handle())?;
++            Ok(())
++        })
++        .build(tauri::generate_context!())
++        .expect("error while building tauri application")
++        .run(|_app, event| {
++            if let RunEvent::Exit = event {
++                sidecar::stop();
++            }
++        });
++}
++
++/// Re-register the global hotkey to a new accelerator (called from Settings).
++/// Returns an error if the accelerator string is invalid so the UI can warn the user.
++#[tauri::command]
++fn register_shortcut(app: tauri::AppHandle, accelerator: String) -> Result<(), String> {
++    app.global_shortcut().unregister_all().ok();
++    register_hotkey(&app, &accelerator)
++}
++
++/// Bind `accelerator` to toggle the overlay: surface the window and emit `toggle-overlay`
++/// so the frontend expands/collapses the toolbar.
++fn register_hotkey(app: &tauri::AppHandle, accelerator: &str) -> Result<(), String> {
++    let handle = app.clone();
++    app.global_shortcut()
++        .on_shortcut(accelerator, move |_app, _sc, event| {
++            if event.state != ShortcutState::Pressed {
++                return;
++            }
++            if let Some(main) = handle.get_webview_window("main") {
++                let _ = main.show();
++                let _ = main.set_focus();
++                let _ = main.emit("toggle-overlay", ());
++            }
++        })
++        .map_err(|err| {
++            eprintln!("[hotkey] failed to register {accelerator}: {err}");
++            format!("{err}")
++        })
++}
++
++/// System tray with Show / Quit.
++fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
++    let show = MenuItemBuilder::with_id("show", "Show GlassView").build(app)?;
++    let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
++    let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
++
++    TrayIconBuilder::new()
++        .icon(app.default_window_icon().unwrap().clone())
++        .tooltip("GlassView")
++        .menu(&menu)
++        .on_menu_event(|app, event| match event.id().as_ref() {
++            "show" => {
++                if let Some(main) = app.get_webview_window("main") {
++                    let _ = main.show();
++                    let _ = main.set_focus();
++                }
++            }
++            "quit" => app.exit(0),
++            _ => {}
++        })
++        .build(app)?;
++    Ok(())
++}
+diff --git a/apps/desktop/src-tauri/tauri.conf.json b/apps/desktop/src-tauri/tauri.conf.json
+new file mode 100644
+index 0000000..9520c85
+--- /dev/null
++++ b/apps/desktop/src-tauri/tauri.conf.json
+@@ -0,0 +1,49 @@
++{
++  "$schema": "https://schema.tauri.app/config/2",
++  "productName": "GlassView",
++  "version": "0.1.0",
++  "identifier": "com.glassview.desktop",
++  "build": {
++    "beforeDevCommand": "npm run dev",
++    "devUrl": "http://localhost:1420",
++    "beforeBuildCommand": "npm run build",
++    "frontendDist": "../dist"
++  },
++  "app": {
++    "withGlobalTauri": true,
++    "windows": [
++      {
++        "label": "main",
++        "title": "GlassView",
++        "width": 360,
++        "height": 480,
++        "transparent": true,
++        "decorations": false,
++        "alwaysOnTop": true,
++        "skipTaskbar": true,
++        "resizable": false,
++        "shadow": false,
++        "visible": true
++      }
++    ],
++    "security": {
++      "csp": {
++        "default-src": "'self'",
++        "connect-src": "'self' http://127.0.0.1:8765",
++        "img-src": "'self' data: blob:",
++        "style-src": "'self' 'unsafe-inline'"
++      }
++    }
++  },
++  "bundle": {
++    "active": true,
++    "targets": "all",
++    "icon": [
++      "icons/32x32.png",
++      "icons/128x128.png",
++      "icons/128x128@2x.png",
++      "icons/icon.icns",
++      "icons/icon.ico"
++    ]
++  }
++}
+diff --git a/apps/desktop/src/App.tsx b/apps/desktop/src/App.tsx
+new file mode 100644
+index 0000000..93a0348
+--- /dev/null
++++ b/apps/desktop/src/App.tsx
+@@ -0,0 +1,317 @@
++import { useCallback, useEffect, useRef, useState } from "react";
++import { Pill } from "./components/Pill";
++import { TOOLS } from "./components/tools";
++import { Panel } from "./components/panels/Panel";
++import { ChatPanel } from "./components/panels/ChatPanel";
++import { HistoryPanel } from "./components/panels/HistoryPanel";
++import { SettingsPanel } from "./components/panels/SettingsPanel";
++import { ErrorPanel } from "./components/panels/ErrorPanel";
++import { VoicePanel } from "./components/panels/VoicePanel";
++import { RegionSelect } from "./components/RegionSelect";
++import { useDrag } from "./hooks/useDrag";
++import { useTheme } from "./hooks/useTheme";
++import { useHealth } from "./hooks/useHealth";
++import { useSettings } from "./hooks/useSettings";
++import { useChat } from "./hooks/useChat";
++import {
++  isTauri, startDragging, fitWindowToContent, registerShortcut, watchWindowMoves,
++  onToggleOverlay, onRegionCancel, captureScreen, setFullscreen,
++  armRegionEscape, disarmRegionEscape,
++} from "./lib/tauri";
++import type { ToolId } from "./types";
++
++const TITLES: Record<ToolId, string> = {
++  chat: "Chat",
++  region: "Region",
++  voice: "Voice",
++  history: "Past Chats",
++  settings: "Settings",
++};
++
++const TAURI = isTauri();
++
++export default function App() {
++  const { theme, setTheme } = useTheme();
++  const { settings, update, apiKey, setApiKey } = useSettings();
++  const { model, error: healthError } = useHealth();
++
++  const [expanded, setExpanded] = useState(false);
++  const [activeTool, setActiveTool] = useState<ToolId | null>(null);
++  const [hasNotif, setHasNotif] = useState(false);
++  const [regionImage, setRegionImage] = useState<string | null>(null);
++  const activeRef = useRef<ToolId | null>(null);
++  activeRef.current = activeTool;
++  const wrapRef = useRef<HTMLDivElement>(null);
++
++  const chat = useChat(() => {
++    if (activeRef.current !== "chat") setHasNotif(true);
++  });
++  const chatRef = useRef(chat);
++  chatRef.current = chat;
++
++  const { pos, moved, onMouseDown: jsDrag } = useDrag({
++    x: window.innerWidth - 220,
++    y: window.innerHeight - 80,
++  });
++
++  useEffect(() => {
++    document.body.dataset.stage = TAURI ? "tauri" : "dev";
++  }, []);
++
++  // Keep the window anchor synced to user drags.
++  useEffect(() => {
++    if (!TAURI) return;
++    let un: (() => void) | undefined;
++    watchWindowMoves().then((u) => { un = u; });
++    return () => un?.();
++  }, []);
++
++  // Native window: fit to content (logo anchored) whenever the toolbar/panel open or
++  // their content grows. The panel is out of flow, so re-run on expanded/activeTool and
++  // observe both the pill and the panel for streaming/content growth.
++  useEffect(() => {
++    if (!TAURI || regionImage) return; // don't resize while fullscreen for region
++    const wrap = wrapRef.current;
++    if (!wrap) return;
++    let raf = 0;
++    let timer = 0;
++    const fit = () => fitWindowToContent(wrap);
++    const ro = new ResizeObserver(() => {
++      cancelAnimationFrame(raf);
++      clearTimeout(timer);
++      // Coalesce rapid frames (CSS animation) into one call at the end
++      timer = window.setTimeout(() => { raf = requestAnimationFrame(fit); }, 32);
++    });
++    wrap.querySelectorAll(".gv-pill, .gv-panel").forEach((el) => ro.observe(el));
++    requestAnimationFrame(fit);
++    return () => { ro.disconnect(); clearTimeout(timer); cancelAnimationFrame(raf); };
++  }, [expanded, activeTool, regionImage]);
++
++  // Rebind the global shortcut when it changes (native only).
++  useEffect(() => {
++    if (TAURI) {
++      registerShortcut(settings.shortcut).catch((err) => {
++        console.error("[shortcut] failed to register:", err);
++      });
++    }
++  }, [settings.shortcut]);
++
++  // Leave region mode: drop fullscreen, disarm the Esc failsafe, clear the capture.
++  const exitRegion = useCallback(() => {
++    setRegionImage(null);
++    disarmRegionEscape().catch(() => {});
++    setFullscreen(false).catch(() => {});
++  }, []);
++  const exitRegionRef = useRef(exitRegion);
++  exitRegionRef.current = exitRegion;
++
++  // Events from Rust: hotkey toggle + region force-cancel failsafe.
++  useEffect(() => {
++    const uns: Array<() => void> = [];
++    onToggleOverlay(() => {
++      setExpanded((e) => !e);
++      setHasNotif(false);
++    }).then((u) => uns.push(u));
++    onRegionCancel(() => exitRegionRef.current()).then((u) => uns.push(u));
++    return () => uns.forEach((u) => u());
++  }, []);
++
++  // Enter region mode: capture the screen, go fullscreen, arm the Esc failsafe, then
++  // render the selector inside this (working) window.
++  const startRegion = useCallback(async () => {
++    if (!TAURI) return;
++    try {
++      const img = await captureScreen();
++      if (!img) return;
++      setActiveTool(null);
++      setRegionImage(img);
++      await setFullscreen(true);
++      await armRegionEscape();
++    } catch {
++      exitRegionRef.current();
++    }
++  }, []);
++
++  const toggleTool = useCallback(
++    (id: ToolId) => {
++      if (id === "region") {
++        setActiveTool(null);
++        startRegion();
++        return;
++      }
++      setActiveTool((prev) => (prev === id ? null : id));
++    },
++    [startRegion],
++  );
++
++  const toggleExpand = useCallback(() => {
++    setExpanded((e) => {
++      if (e) setActiveTool(null);
++      return !e;
++    });
++    setHasNotif(false);
++  }, []);
++
++  const onLogoClick = useCallback(() => {
++    // Native: the click is decided in onDragMouseDown's mouseup (startDragging would
++    // otherwise eat the click), so this is a no-op there.
++    if (TAURI) return;
++    if (moved.current) {
++      moved.current = false;
++      return;
++    }
++    toggleExpand();
++  }, [moved, toggleExpand]);
++
++  const onDragMouseDown = useCallback(
++    (e: React.MouseEvent) => {
++      if (!TAURI) {
++        jsDrag(e);
++        return;
++      }
++      if (e.button !== 0) return;
++      // Hand off to the OS window drag only once the press moves past a threshold;
++      // a release without movement counts as a click and toggles the toolbar.
++      const sx = e.clientX;
++      const sy = e.clientY;
++      let dragged = false;
++      const cleanup = () => {
++        window.removeEventListener("mousemove", move);
++        window.removeEventListener("mouseup", up);
++      };
++      const move = (ev: MouseEvent) => {
++        if (!dragged && (Math.abs(ev.clientX - sx) > 4 || Math.abs(ev.clientY - sy) > 4)) {
++          dragged = true;
++          cleanup();
++          startDragging();
++        }
++      };
++      const up = () => {
++        cleanup();
++        if (!dragged) toggleExpand();
++      };
++      window.addEventListener("mousemove", move);
++      window.addEventListener("mouseup", up);
++    },
++    [jsDrag, toggleExpand],
++  );
++
++  const closePanel = useCallback(() => setActiveTool(null), []);
++
++  useEffect(() => {
++    const handler = (e: KeyboardEvent) => {
++      if (!expanded) return;
++      if (e.target instanceof HTMLElement && e.target.tagName === "INPUT") return;
++      if (e.key === "Escape") return setActiveTool(null);
++      const tool = TOOLS.find((t) => t.kbd === e.key.toUpperCase());
++      if (tool) {
++        e.preventDefault();
++        toggleTool(tool.id);
++      }
++    };
++    window.addEventListener("keydown", handler);
++    return () => window.removeEventListener("keydown", handler);
++  }, [expanded, toggleTool]);
++
++  useEffect(() => {
++    if (!activeTool || !settings.closeOnBlur) return;
++    const handler = (e: MouseEvent) => {
++      if (e.target instanceof HTMLElement && !e.target.closest(".gv-wrap")) {
++        setActiveTool(null);
++      }
++    };
++    window.addEventListener("mousedown", handler);
++    return () => window.removeEventListener("mousedown", handler);
++  }, [activeTool, settings.closeOnBlur]);
++
++  // Region Esc (webview-side; the Rust global Esc is the failsafe if this is frozen).
++  useEffect(() => {
++    if (!regionImage) return;
++    const onKey = (e: KeyboardEvent) => {
++      if (e.key === "Escape") exitRegion();
++    };
++    window.addEventListener("keydown", onKey);
++    return () => window.removeEventListener("keydown", onKey);
++  }, [regionImage, exitRegion]);
++
++  const onRegionDone = useCallback((cropped: string) => {
++    exitRegion();
++    setExpanded(true);
++    setActiveTool("chat");
++    chatRef.current.send("What's in this region?", cropped);
++  }, [exitRegion]);
++
++  const openHistoryChat = useCallback((id: string) => {
++    chatRef.current.load(id);
++    setActiveTool("chat");
++  }, []);
++
++  const renderPanel = () => {
++    if (!activeTool) return null;
++    if (activeTool === "chat" && healthError) {
++      return (
++        <Panel title={TITLES.chat} onClose={closePanel}>
++          <ErrorPanel onOpenSettings={() => setActiveTool("settings")} />
++        </Panel>
++      );
++    }
++    return (
++      <Panel title={TITLES[activeTool]} onClose={closePanel}>
++        {activeTool === "chat" && (
++          <ChatPanel
++            messages={chat.messages}
++            thinking={chat.thinking}
++            streaming={chat.streaming}
++            streamText={chat.streamText}
++            busy={chat.busy}
++            onSend={chat.send}
++          />
++        )}
++        {activeTool === "history" && <HistoryPanel onOpen={openHistoryChat} visible={activeTool === "history"} />}
++        {activeTool === "voice" && (
++          <VoicePanel
++            onTranscript={(text) => {
++              setActiveTool("chat");
++              chat.send(text);
++            }}
++          />
++        )}
++        {activeTool === "settings" && (
++          <SettingsPanel
++            settings={settings}
++            update={update}
++            theme={theme}
++            setTheme={setTheme}
++            apiKey={apiKey}
++            setApiKey={setApiKey}
++            model={model}
++          />
++        )}
++      </Panel>
++    );
++  };
++
++  // Browser: float at the JS-drag position. Native: pin bottom-right of the fitted window.
++  const wrapStyle: React.CSSProperties = TAURI
++    ? { position: "fixed", right: 0, bottom: 0 }
++    : { position: "fixed", left: pos.x, top: pos.y };
++
++  return (
++    <>
++      {regionImage && (
++        <RegionSelect image={regionImage} onDone={onRegionDone} onCancel={exitRegion} />
++      )}
++      <div className="gv-wrap" ref={wrapRef} style={wrapStyle}>
++        {renderPanel()}
++        <Pill
++          expanded={expanded}
++          activeTool={activeTool}
++          hasNotif={hasNotif}
++          onLogoClick={onLogoClick}
++          onToggleTool={toggleTool}
++          onDragMouseDown={onDragMouseDown}
++        />
++      </div>
++    </>
++  );
++}
+diff --git a/apps/desktop/src/components/RegionSelect.tsx b/apps/desktop/src/components/RegionSelect.tsx
+new file mode 100644
+index 0000000..a036f14
+--- /dev/null
++++ b/apps/desktop/src/components/RegionSelect.tsx
+@@ -0,0 +1,90 @@
++import { useEffect, useRef, useState } from "react";
++
++interface Box { x: number; y: number; w: number; h: number; }
++
++interface RegionSelectProps {
++  image: string; // PNG data URL of the full screen (physical pixels)
++  onDone: (croppedDataUrl: string) => void;
++  onCancel: () => void;
++}
++
++/**
++ * Fullscreen region selector rendered inside the MAIN window. Shows the captured screen,
++ * lets the user drag a rectangle, and crops it client-side with a canvas (handling the
++ * HiDPI scale between CSS pixels and the physical capture). Escapable via the Cancel
++ * button, the parent's Esc handler, and the Rust global-Escape failsafe.
++ */
++export function RegionSelect({ image, onDone, onCancel }: RegionSelectProps) {
++  const [box, setBox] = useState<Box | null>(null);
++  const [dragging, setDragging] = useState(false);
++  const start = useRef<{ x: number; y: number } | null>(null);
++  const imgRef = useRef<HTMLImageElement>(null);
++  // Mirror of `box` so the window-level mouseup listener always sees the latest selection.
++  const boxRef = useRef<Box | null>(null);
++  boxRef.current = box;
++
++  const crop = (b: Box) => {
++    const img = imgRef.current;
++    if (!img || !img.naturalWidth) return onCancel();
++    const sx = img.naturalWidth / window.innerWidth;
++    const sy = img.naturalHeight / window.innerHeight;
++    const cw = Math.max(1, Math.round(b.w * sx));
++    const ch = Math.max(1, Math.round(b.h * sy));
++    const canvas = document.createElement("canvas");
++    canvas.width = cw;
++    canvas.height = ch;
++    const ctx = canvas.getContext("2d");
++    if (!ctx) return onCancel();
++    ctx.drawImage(img, b.x * sx, b.y * sy, cw, ch, 0, 0, cw, ch);
++    onDone(canvas.toDataURL("image/png"));
++  };
++
++  const finishDrag = () => {
++    setDragging(false);
++    const b = boxRef.current;
++    if (b && b.w > 8 && b.h > 8) crop(b);
++    else setBox(null);
++  };
++
++  const onDown = (e: React.MouseEvent) => {
++    if ((e.target as HTMLElement).closest(".region-cancel")) return;
++    start.current = { x: e.clientX, y: e.clientY };
++    setDragging(true);
++    setBox({ x: e.clientX, y: e.clientY, w: 0, h: 0 });
++  };
++  const onMove = (e: React.MouseEvent) => {
++    if (!dragging || !start.current) return;
++    const s = start.current;
++    setBox({
++      x: Math.min(e.clientX, s.x),
++      y: Math.min(e.clientY, s.y),
++      w: Math.abs(e.clientX - s.x),
++      h: Math.abs(e.clientY - s.y),
++    });
++  };
++
++  // Capture mouseup at the window level so releasing outside the overlay still
++  // finishes the selection (the Rust global Escape remains the ultimate failsafe).
++  useEffect(() => {
++    if (!dragging) return;
++    window.addEventListener("mouseup", finishDrag);
++    return () => window.removeEventListener("mouseup", finishDrag);
++  }, [dragging]);
++
++  return (
++    <div className="region-overlay" onMouseDown={onDown} onMouseMove={onMove}>
++      <img ref={imgRef} className="region-shot" src={image} alt="" />
++      <div className="region-bg" />
++      {!dragging && !box && (
++        <div className="region-hint">
++          <div className="region-hint-t">Select a region</div>
++          <div className="region-hint-s">Click and drag · Esc to cancel</div>
++        </div>
++      )}
++      {box && box.w > 2 && (
++        <div className="region-sel" style={{ left: box.x, top: box.y, width: box.w, height: box.h }} />
++      )}
++      <button className="region-cancel" onClick={onCancel}>Cancel — esc</button>
++    </div>
++  );
++}
+diff --git a/apps/desktop/src/components/panels/ChatPanel.tsx b/apps/desktop/src/components/panels/ChatPanel.tsx
+new file mode 100644
+index 0000000..8e77f22
+--- /dev/null
++++ b/apps/desktop/src/components/panels/ChatPanel.tsx
+@@ -0,0 +1,138 @@
++import { useEffect, useRef, useState } from "react";
++import { Icon } from "../Icon";
++import { Icons } from "../icons";
++import type { Message } from "../../types";
++
++interface ChatPanelProps {
++  messages: Message[];
++  thinking: boolean;
++  streaming: boolean;
++  streamText: string;
++  busy: boolean;
++  onSend: (text: string, image?: string) => void;
++}
++
++/** Read a File as a data URL (base64) for the /chat image field. */
++function readAsDataUrl(file: File): Promise<string> {
++  return new Promise((resolve, reject) => {
++    const r = new FileReader();
++    r.onload = () => resolve(r.result as string);
++    r.onerror = reject;
++    r.readAsDataURL(file);
++  });
++}
++
++export function ChatPanel({ messages, thinking, streaming, streamText, busy, onSend }: ChatPanelProps) {
++  const [input, setInput] = useState("");
++  const [attached, setAttached] = useState<{ name: string; dataUrl: string } | null>(null);
++  const [dropOver, setDropOver] = useState(false);
++  const msgsRef = useRef<HTMLDivElement>(null);
++  const fileRef = useRef<HTMLInputElement>(null);
++  const inputRef = useRef<HTMLInputElement>(null);
++
++  useEffect(() => {
++    if (msgsRef.current) msgsRef.current.scrollTop = msgsRef.current.scrollHeight;
++  }, [messages, streamText, thinking]);
++
++  // Focus the input once when the panel opens, without autoFocus stealing focus
++  // on every parent re-render during streaming.
++  useEffect(() => {
++    inputRef.current?.focus();
++  }, []);
++
++  const attach = async (file: File | undefined) => {
++    if (!file) return;
++    setAttached({ name: file.name, dataUrl: await readAsDataUrl(file) });
++  };
++
++  const send = () => {
++    if ((!input.trim() && !attached) || busy) return;
++    onSend(input, attached?.dataUrl);
++    setInput("");
++    setAttached(null);
++  };
++
++  const hasThread = messages.length > 0 || thinking || streaming;
++
++  return (
++    <>
++      {/* Context strip — placeholder until live window-context capture lands. */}
++      <div className="gv-ctx">
++        <div className="gv-ctx-thumb">
++          {[90, 70, 85, 60, 75].map((w, i) => (
++            <div key={i} className="gv-ctx-line" style={{ width: `${w}%` }} />
++          ))}
++        </div>
++        <div className="gv-ctx-meta">
++          <div className="gv-ctx-app">No context captured</div>
++          <div className="gv-ctx-sub">Attach a file or use Region</div>
++        </div>
++      </div>
++
++      {/* File drop / attach */}
++      <div
++        className={`gv-drop${dropOver ? " over" : ""}`}
++        onDragOver={(e) => { e.preventDefault(); setDropOver(true); }}
++        onDragLeave={() => setDropOver(false)}
++        onDrop={(e) => { e.preventDefault(); setDropOver(false); attach(e.dataTransfer.files?.[0]); }}
++        onClick={() => fileRef.current?.click()}
++      >
++        <Icon d={Icons.attach} size={13} stroke={attached ? "#3BAAFF" : "var(--gv-textFaint)"} sw={1.4} />
++        {attached ? (
++          <div className="gv-file-chip">
++            {attached.name}
++            <button className="gv-file-rm" onClick={(e) => { e.stopPropagation(); setAttached(null); }}>✕</button>
++          </div>
++        ) : (
++          <span className="gv-drop-label">Drop a file or <span>click to attach</span></span>
++        )}
++        <input
++          ref={fileRef}
++          type="file"
++          hidden
++          onChange={(e) => attach(e.target.files?.[0] ?? undefined)}
++        />
++      </div>
++
++      {hasThread && (
++        <div className="gv-msgs" ref={msgsRef}>
++          {messages.map((m, i) => (
++            <div key={i} className={`gv-msg gv-msg-${m.role === "user" ? "u" : "a"}`}>
++              <div className={`gv-bubble gv-bubble-${m.role === "user" ? "u" : "a"}`}>{m.text}</div>
++            </div>
++          ))}
++          {thinking && (
++            <div className="gv-msg gv-msg-a">
++              <div className="gv-bubble gv-bubble-a">
++                <div className="thinking-dots"><div className="td" /><div className="td" /><div className="td" /></div>
++              </div>
++            </div>
++          )}
++          {streaming && streamText && (
++            <div className="gv-msg gv-msg-a">
++              <div className="gv-bubble gv-bubble-a">{streamText}<span className="gv-cursor" /></div>
++            </div>
++          )}
++        </div>
++      )}
++
++      <div className="gv-input-row">
++        <button className="gv-attach-btn" onClick={() => fileRef.current?.click()}>
++          <Icon d={Icons.attach} size={13} sw={1.4} />
++        </button>
++        <input
++          ref={inputRef}
++          className="gv-input"
++          placeholder="Ask about your screen…"
++          value={input}
++          onChange={(e) => setInput(e.target.value)}
++          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
++          disabled={busy}
++        />
++        <button className="gv-send" onClick={send} disabled={(!input.trim() && !attached) || busy}>
++          <Icon d={Icons.send} size={13} stroke="white" sw={1.8} />
++        </button>
++      </div>
++    </>
++  );
++}
+diff --git a/apps/desktop/src/components/panels/HistoryPanel.tsx b/apps/desktop/src/components/panels/HistoryPanel.tsx
+new file mode 100644
+index 0000000..908ea3d
+--- /dev/null
++++ b/apps/desktop/src/components/panels/HistoryPanel.tsx
+@@ -0,0 +1,72 @@
++import { useEffect, useMemo, useState } from "react";
++import { api, type ChatSummary } from "../../api/client";
++
++interface HistoryPanelProps {
++  onOpen: (chatId: string) => void;
++  visible: boolean;
++}
++
++/** Relative "2m ago" / "3h ago" from an ISO/SQL timestamp. */
++function relTime(ts: string | null): string {
++  if (!ts) return "";
++  const then = new Date(ts.includes("T") ? ts : ts.replace(" ", "T") + "Z").getTime();
++  if (Number.isNaN(then)) return "";
++  const s = Math.max(0, (Date.now() - then) / 1000);
++  if (s < 60) return "just now";
++  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
++  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
++  if (s < 172800) return "Yesterday";
++  return `${Math.floor(s / 86400)}d ago`;
++}
++
++export function HistoryPanel({ onOpen, visible }: HistoryPanelProps) {
++  const [chats, setChats] = useState<ChatSummary[]>([]);
++  const [query, setQuery] = useState("");
++  const [loading, setLoading] = useState(true);
++
++  useEffect(() => {
++    if (!visible) return;
++    let alive = true;
++    setLoading(true);
++    api
++      .listChats()
++      .then((r) => alive && setChats(r.chats))
++      .catch(() => alive && setChats([]))
++      .finally(() => alive && setLoading(false));
++    return () => { alive = false; };
++  }, [visible]);
++
++  const filtered = useMemo(() => {
++    const q = query.toLowerCase();
++    return chats.filter((c) => c.title.toLowerCase().includes(q));
++  }, [chats, query]);
++
++  return (
++    <>
++      <input
++        className="gv-hist-search"
++        placeholder="Search past chats…"
++        value={query}
++        onChange={(e) => setQuery(e.target.value)}
++        autoFocus
++      />
++      <div className="gv-hist-list">
++        {loading ? (
++          <div className="gv-hist-empty">Loading…</div>
++        ) : filtered.length === 0 ? (
++          <div className="gv-hist-empty">{chats.length === 0 ? "No chats yet" : "No matches"}</div>
++        ) : (
++          filtered.map((c) => (
++            <div key={c.id} className="gv-hist-item" onClick={() => onOpen(c.id)}>
++              <div className="gv-hist-row">
++                <span className="gv-hist-title">{c.title || "Untitled"}</span>
++                <span className="gv-hist-time">{relTime(c.updated_at)}</span>
++              </div>
++              <div className="gv-hist-preview">{c.message_count} messages</div>
++            </div>
++          ))
++        )}
++      </div>
++    </>
++  );
++}
+diff --git a/apps/desktop/src/components/panels/SettingsPanel.tsx b/apps/desktop/src/components/panels/SettingsPanel.tsx
+new file mode 100644
+index 0000000..5b3caf9
+--- /dev/null
++++ b/apps/desktop/src/components/panels/SettingsPanel.tsx
+@@ -0,0 +1,116 @@
++import { detectProvider } from "../../hooks/useSettings";
++import type { Settings, ThemeName } from "../../types";
++
++interface SettingsPanelProps {
++  settings: Settings;
++  update: <K extends keyof Settings>(key: K, value: Settings[K]) => void;
++  theme: ThemeName;
++  setTheme: (t: ThemeName) => void;
++  apiKey: string;
++  setApiKey: (k: string) => void;
++  model: string | null;
++}
++
++type BooleanSettingKey = {
++  [K in keyof Settings]: Settings[K] extends boolean ? K : never;
++}[keyof Settings];
++
++const BEHAVIOR: [string, BooleanSettingKey][] = [
++  ["Close on click outside", "closeOnBlur"],
++  ["Auto-launch on login", "autoLaunch"],
++  ["Stream responses", "streaming"],
++];
++const PRIVACY: [string, BooleanSettingKey][] = [
++  ["Privacy redaction", "privacy"],
++  ["Auto-capture context", "autoContext"],
++];
++
++export function SettingsPanel({ settings, update, theme, setTheme, apiKey, setApiKey, model }: SettingsPanelProps) {
++  const provider = detectProvider(apiKey);
++  const providerLabel = provider === "ollama" ? "Ollama" : provider === "openai" ? "OpenAI" : "Anthropic";
++
++  const toggle = (key: BooleanSettingKey) => update(key, !settings[key]);
++
++  return (
++    <div className="gv-settings">
++      <div className="gv-sg">
++        <div className="gv-sg-label">Appearance</div>
++        <div className="gv-sr">
++          <span className="gv-sr-name">Theme</span>
++          <div style={{ display: "flex", gap: 6 }}>
++            {(["dark", "light"] as ThemeName[]).map((th) => (
++              <button
++                key={th}
++                className={`gv-theme-btn${theme === th ? " on" : ""}`}
++                onClick={() => setTheme(th)}
++              >
++                {th === "dark" ? "Dark" : "Light"}
++              </button>
++            ))}
++          </div>
++        </div>
++      </div>
++
++      <div className="gv-sg">
++        <div className="gv-sg-label">Model</div>
++        <div className="gv-sr" style={{ flexDirection: "column", alignItems: "stretch", gap: 8 }}>
++          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
++            <span className="gv-sr-name">API Key</span>
++            <span className={`gv-api-badge ${provider}`}>{providerLabel}</span>
++          </div>
++          <input
++            className="gv-api-input"
++            type="password"
++            placeholder="sk-… or sk-ant-… or leave blank for Ollama"
++            value={apiKey}
++            onChange={(e) => setApiKey(e.target.value)}
++          />
++        </div>
++        {provider === "ollama" && (
++          <div className="gv-sr">
++            <span className="gv-sr-name">Ollama model</span>
++            <span className="gv-sr-val">{model ?? "not detected"}</span>
++          </div>
++        )}
++      </div>
++
++      <div className="gv-sg">
++        <div className="gv-sg-label">Shortcut</div>
++        <div className="gv-sr">
++          <span className="gv-sr-name">Global trigger</span>
++          <input
++            className="gv-kbd-input"
++            value={settings.shortcut}
++            onChange={(e) => update("shortcut", e.target.value)}
++          />
++        </div>
++      </div>
++
++      <div className="gv-sg">
++        <div className="gv-sg-label">Behavior</div>
++        {BEHAVIOR.map(([label, key]) => (
++          <div key={key} className="gv-sr">
++            <span className="gv-sr-name">{label}</span>
++            <button
++              className={`gv-toggle${settings[key] ? " on" : ""}`}
++              onClick={() => toggle(key)}
++            />
++          </div>
++        ))}
++      </div>
++
++      <div className="gv-sg">
++        <div className="gv-sg-label">Privacy</div>
++        {PRIVACY.map(([label, key]) => (
++          <div key={key} className="gv-sr">
++            <span className="gv-sr-name">{label}</span>
++            <button
++              className={`gv-toggle${settings[key] ? " on" : ""}`}
++              onClick={() => toggle(key)}
++            />
++          </div>
++        ))}
++      </div>
++    </div>
++  );
++}
+diff --git a/apps/desktop/src/components/panels/VoicePanel.tsx b/apps/desktop/src/components/panels/VoicePanel.tsx
+new file mode 100644
+index 0000000..3a1d4c2
+--- /dev/null
++++ b/apps/desktop/src/components/panels/VoicePanel.tsx
+@@ -0,0 +1,98 @@
++import { useEffect, useRef, useState } from "react";
++import { Icon } from "../Icon";
++import { Icons } from "../icons";
++
++interface VoicePanelProps {
++  onTranscript: (text: string) => void;
++}
++
++// Minimal shape of the Web Speech API we use (not in the standard TS lib).
++type SpeechRec = {
++  lang: string;
++  interimResults: boolean;
++  continuous: boolean;
++  onresult: (e: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void;
++  onend: () => void;
++  onerror: (e: { error?: string; message?: string }) => void;
++  start: () => void;
++  stop: () => void;
++};
++
++function getRecognizer(): SpeechRec | null {
++  const w = window as unknown as { SpeechRecognition?: new () => SpeechRec; webkitSpeechRecognition?: new () => SpeechRec };
++  const Ctor = w.SpeechRecognition ?? w.webkitSpeechRecognition;
++  return Ctor ? new Ctor() : null;
++}
++
++export function VoicePanel({ onTranscript }: VoicePanelProps) {
++  const [recording, setRecording] = useState(false);
++  const [transcript, setTranscript] = useState("");
++  const [supported, setSupported] = useState(true);
++  const [error, setError] = useState<string | null>(null);
++  const recRef = useRef<SpeechRec | null>(null);
++
++  useEffect(() => {
++    return () => recRef.current?.stop();
++  }, []);
++
++  const toggle = () => {
++    if (recording) {
++      recRef.current?.stop();
++      return;
++    }
++    const rec = getRecognizer();
++    if (!rec) {
++      setSupported(false);
++      return;
++    }
++    rec.lang = "en-US";
++    rec.interimResults = true;
++    rec.continuous = false;
++    let finalText = "";
++    rec.onresult = (e) => {
++      let text = "";
++      for (let i = 0; i < e.results.length; i++) text += e.results[i][0].transcript;
++      finalText = text;
++      setTranscript(text);
++      setError(null);
++    };
++    rec.onerror = (e: { error?: string; message?: string }) => {
++      setRecording(false);
++      setError(e.message || e.error || "Voice recognition failed. Try again.");
++    };
++    rec.onend = () => {
++      setRecording(false);
++      const t = finalText.trim();
++      if (t) {
++        setError(null);
++        onTranscript(t);
++      }
++    };
++    recRef.current = rec;
++    setTranscript("");
++    setError(null);
++    setRecording(true);
++    rec.start();
++  };
++
++  if (!supported) {
++    return <div className="gv-hist-empty">Voice input isn't supported in this runtime.</div>;
++  }
++
++  return (
++    <div className="gv-voice">
++      <div className="voice-ring">
++        {recording && (
++          <>
++            <div className="vring" /><div className="vring" /><div className="vring" />
++          </>
++        )}
++        <button className={`voice-btn${recording ? " rec" : ""}`} onClick={toggle}>
++          <Icon d={Icons.mic} size={22} stroke="currentColor" sw={1.5} />
++        </button>
++      </div>
++      <div className="voice-transcript">{transcript || (recording ? "Listening…" : "Tap to speak")}</div>
++      <div className="voice-label">{error ? error : recording ? "Recording — tap to stop" : "Voice input"}</div>
++    </div>
++  );
++}
+diff --git a/apps/desktop/src/hooks/useChat.ts b/apps/desktop/src/hooks/useChat.ts
+new file mode 100644
+index 0000000..45d4872
+--- /dev/null
++++ b/apps/desktop/src/hooks/useChat.ts
+@@ -0,0 +1,99 @@
++import { useCallback, useRef, useState } from "react";
++import { api, type ApiMessage } from "../api/client";
++import type { Message } from "../types";
++
++function toUiMessages(msgs: ApiMessage[]): Message[] {
++  return msgs
++    .filter((m) => m.role === "user" || m.role === "assistant")
++    .map((m) => ({ role: m.role as Message["role"], text: m.content }));
++}
++
++/**
++ * Owns one conversation: lazily creates a chat_id, sends turns to the streaming /chat
++ * endpoint, and exposes the running transcript + thinking/streaming flags. onDone fires
++ * when an assistant turn finishes (used to raise the collapsed-notif pulse).
++ */
++export function useChat(onDone?: () => void) {
++  const [chatId, setChatId] = useState<string | null>(null);
++  const [messages, setMessages] = useState<Message[]>([]);
++  const [thinking, setThinking] = useState(false);
++  const [streaming, setStreaming] = useState(false);
++  const [streamText, setStreamText] = useState("");
++  const busy = thinking || streaming;
++  const cancelled = useRef(false);
++
++  const ensureChat = useCallback(async (): Promise<string> => {
++    if (chatId) return chatId;
++    const { chat } = await api.createChat();
++    setChatId(chat.id);
++    return chat.id;
++  }, [chatId]);
++
++  const send = useCallback(
++    async (text: string, image?: string) => {
++      const msg = text.trim();
++      if ((!msg && !image) || busy) return;
++      cancelled.current = false;
++      // Only show a user bubble when text was actually sent. Image-only turns
++      // rely on the backend's default prompt ("Describe this screenshot briefly.").
++      if (msg) setMessages((m) => [...m, { role: "user", text: msg }]);
++      setThinking(true);
++      setStreamText("");
++
++      try {
++        const id = await ensureChat();
++        let acc = "";
++        for await (const chunk of api.chat(id, msg, image)) {
++          if (cancelled.current) break;
++          acc += chunk;
++          setThinking(false);
++          setStreaming(true);
++          setStreamText(acc);
++        }
++        if (cancelled.current) {
++          // If we received partial text before a switch/reset, keep it so the
++          // user isn't left with a dangling user bubble.
++          if (acc) {
++            setMessages((m) => [...m, { role: "assistant", text: `${acc}\n\n[cancelled]` }]);
++          }
++        } else {
++          const answer = acc || "(no response)";
++          setMessages((m) => [...m, { role: "assistant", text: answer }]);
++          onDone?.();
++        }
++      } catch (e) {
++        setMessages((m) => [
++          ...m,
++          { role: "assistant", text: `[error] ${(e as Error).message}` },
++        ]);
++      } finally {
++        setThinking(false);
++        setStreaming(false);
++        setStreamText("");
++      }
++    },
++    [busy, ensureChat, onDone],
++  );
++
++  /** Load an existing chat (from History) into this panel. */
++  const load = useCallback(async (id: string) => {
++    cancelled.current = true;
++    const detail = await api.getChat(id);
++    setChatId(detail.id);
++    setMessages(toUiMessages(detail.messages));
++    setThinking(false);
++    setStreaming(false);
++    setStreamText("");
++  }, []);
++
++  const reset = useCallback(() => {
++    cancelled.current = true;
++    setChatId(null);
++    setMessages([]);
++    setThinking(false);
++    setStreaming(false);
++    setStreamText("");
++  }, []);
++
++  return { chatId, messages, thinking, streaming, streamText, busy, send, load, reset };
++}
+diff --git a/apps/desktop/src/hooks/useSettings.ts b/apps/desktop/src/hooks/useSettings.ts
+new file mode 100644
+index 0000000..3699a4f
+--- /dev/null
++++ b/apps/desktop/src/hooks/useSettings.ts
+@@ -0,0 +1,49 @@
++import { useCallback, useEffect, useState } from "react";
++import type { Provider, Settings } from "../types";
++
++const KEY = "glassview.settings";
++const API_KEY = "glassview.apiKey";
++
++const DEFAULTS: Settings = {
++  shortcut: "Ctrl+Shift+Space",
++  closeOnBlur: true,
++  autoLaunch: false,
++  streaming: true,
++  privacy: true,
++  autoContext: true,
++};
++
++/** Detect provider from an API-key prefix (brief's detectProvider). */
++export function detectProvider(key: string): Provider {
++  if (!key) return "ollama";
++  if (key.startsWith("sk-ant-")) return "anthropic";
++  if (key.startsWith("sk-")) return "openai";
++  return "ollama";
++}
++
++/** Settings + API key, persisted to localStorage and re-applied on load. */
++export function useSettings() {
++  const [settings, setSettings] = useState<Settings>(() => {
++    try {
++      const raw = localStorage.getItem(KEY);
++      return raw ? { ...DEFAULTS, ...JSON.parse(raw) } : DEFAULTS;
++    } catch {
++      return DEFAULTS;
++    }
++  });
++  const [apiKey, setApiKey] = useState<string>(() => localStorage.getItem(API_KEY) ?? "");
++
++  useEffect(() => {
++    localStorage.setItem(KEY, JSON.stringify(settings));
++  }, [settings]);
++
++  useEffect(() => {
++    localStorage.setItem(API_KEY, apiKey);
++  }, [apiKey]);
++
++  const update = useCallback(<K extends keyof Settings>(key: K, value: Settings[K]) => {
++    setSettings((s) => ({ ...s, [key]: value }));
++  }, []);
++
++  return { settings, setSettings, update, apiKey, setApiKey };
++}
+diff --git a/apps/desktop/src/types.ts b/apps/desktop/src/types.ts
+new file mode 100644
+index 0000000..63441bc
+--- /dev/null
++++ b/apps/desktop/src/types.ts
+@@ -0,0 +1,33 @@
++// Shared types for the GlassView overlay.
++
++export type ThemeName = "dark" | "light";
++
++export type ToolId = "chat" | "region" | "voice" | "history" | "settings";
++
++export interface Tool {
++  id: ToolId;
++  label: string;
++  kbd: string;
++  icon: keyof typeof import("./components/icons").Icons;
++}
++
++export interface Pos {
++  x: number;
++  y: number;
++}
++
++export type Provider = "ollama" | "openai" | "anthropic";
++
++export interface Settings {
++  shortcut: string;
++  closeOnBlur: boolean;
++  autoLaunch: boolean;
++  streaming: boolean;
++  privacy: boolean;
++  autoContext: boolean;
++}
++
++export interface Message {
++  role: "user" | "assistant";
++  text: string;
++}
+diff --git a/docs/AI_SCREEN_ASSISTANT_REVIEW.md b/docs/AI_SCREEN_ASSISTANT_REVIEW.md
+new file mode 100644
+index 0000000..b679f5d
+--- /dev/null
++++ b/docs/AI_SCREEN_ASSISTANT_REVIEW.md
+@@ -0,0 +1,124 @@
++# GlassView AI / AI Screen Assistant — Review Progress & Bug Audit
++
++**Reviewed:** 2026-06-26
++**Scope:** `glassview_ai/` backend + `apps/desktop/` Tauri/React frontend
++**Status:** Read-through complete; **all listed bugs patched**; tests/build passing.
++
++## Revert instructions
++
++All patches are captured in git commit `f88e612` on branch `rebuild/glassview`.
++
++```bash
++# Revert the whole bugfix commit
++cd "C:/Users/lichr/OneDrive/Desktop/Old_Projects/Projects/AI_Screen_Assistant"
++git revert f88e612 --no-edit
++
++# Or revert using the included patch file
++git apply -R docs/bugfix-patch-2026-06-26.patch
++```
++
++> Note: the patched files (`glassview_ai/*`, `apps/desktop/src/*`, etc.) are untracked/new in this working tree because of the prior repo restructure. Reverting the commit will delete these new files; the pre-existing `apps/server/`, `apps/shell/`, and `apps/ui/` deletions remain untouched.
++
++## Verification run
++
++| Check | Command | Result |
++|---|---|---|
++| Backend tests | `.venv/Scripts/python.exe -m pytest` | **31 passed** |
++| Frontend build | `cd apps/desktop && npm run build` | **built** (tsc + vite) |
++| Kimi skill load | `kimi -p "list skills"` | **273 ECC skills** available |
++
++## Architecture summary
++
++- **Backend:** FastAPI on `127.0.0.1:8765` with SQLite per-chat history, Ollama streaming chat, RAG memory (`sqlite-vec`/HashEmbedder), OCR fusion (Tesseract optional), privacy redaction, and a small agent loop.
++- **Frontend:** Tauri v2 + React 18 + Vite. Draggable pill → toolbar → glass panels (Chat, Voice, History, Settings). Region capture is done inside the main fullscreen window with a Rust global-Escape failsafe.
++- **Native shell:** Transparent always-on-top window, system tray, global `Ctrl+Shift+Space` toggle, Python backend sidecar auto-spawn.
++
++## Bugs & issues found
++
++### 🔴 Functional bugs
++
++1. **Empty user message is still added when only an image is sent**
++   - **File:** `apps/desktop/src/hooks/useChat.ts:37`
++   - **Issue:** `setMessages((m) => [...m, { role: "user", text: msg }])` runs even if `msg` is empty and only `image` is provided. The UI then shows a blank user bubble.
++   - **Fix:** Only push the user bubble if `msg` is non-empty; still send the image to the backend.
++
++2. **Backend persists partial response instead of the error when streaming fails**
++   - **File:** `glassview_ai/main.py:165-182`
++   - **Issue:** If an exception occurs mid-stream, the `[error] ...` chunk is yielded to the client, but in `finally` the assistant message is saved as `answer = "".join(answer_parts) or error or "(no response)"`. `answer_parts` only contains tokens before the exception, so the DB stores the partial response, not the error.
++   - **Fix:** Append the error to `answer_parts` before persisting, or clear `answer_parts` and persist only the error.
++
++3. **Theme is stored twice, `settings.theme` is never used**
++   - **Files:** `apps/desktop/src/hooks/useSettings.ts:8-15`, `apps/desktop/src/hooks/useTheme.ts`, `apps/desktop/src/components/panels/SettingsPanel.tsx:27-43`
++   - **Issue:** `Settings` has a `theme` field, but theme state is managed separately by `useTheme` with its own `localStorage` key. `SettingsPanel` receives `theme`/`setTheme` from `useTheme`, so `settings.theme` is dead data and can drift.
++   - **Fix:** Either remove `theme` from `Settings` and use `useTheme` everywhere, or have `useSettings` own theme and pass it down.
++
++4. **Global shortcut is never unregistered on settings change (possible duplicate registration)**
++   - **Files:** `apps/desktop/src-tauri/src/main.rs:46-50`, `apps/desktop/src/App.tsx:91-93`
++   - **Issue:** `register_shortcut` calls `unregister_all()` then registers the new accelerator, but if the new accelerator is invalid it fails silently and the frontend has no shortcut. Also, the default shortcut is registered at startup before the frontend loads; when the frontend later registers the same shortcut, it briefly unregister-all then re-register.
++   - **Fix:** Return success/failure from `register_shortcut` so the UI can warn. Consider registering only from the frontend once settings are loaded.
++
++5. **Region selection can get stuck if mouse is released outside the window**
++   - **File:** `apps/desktop/src/components/RegionSelect.tsx:23-44`
++   - **Issue:** `onMouseUp` is bound to the overlay div. If the user drags outside the window and releases, `onMouseUp` never fires and the box stays in dragging state until mouse re-enters.
++   - **Fix:** Add a `window`/`document` mouseup listener while dragging, or rely on the existing Esc failsafe.
++
++### 🟡 UX / reliability issues
++
++6. **Cancel mid-stream leaves the assistant bubble empty**
++   - **File:** `apps/desktop/src/hooks/useChat.ts:44-45`
++   - **Issue:** `cancelled.current` is checked inside the streaming loop; if true, the function returns early. The `finally` block clears `streamText` but never appends any assistant message, so the user sees their own message with no reply.
++   - **Fix:** On cancellation, append an assistant message like "[cancelled]" or keep the partial streamed text as a message.
++
++7. **History panel never refreshes after opening a chat or creating a new one**
++   - **File:** `apps/desktop/src/components/panels/HistoryPanel.tsx:26-34`
++   - **Issue:** `useEffect` with empty deps loads chats once. After sending a message in a new chat, the chat gets a title in the DB but History still shows old data until reopened.
++   - **Fix:** Refresh the list when the panel opens (e.g., re-run on mount and when `activeTool` becomes `"history"`).
++
++8. **Voice transcript is lost if recognition errors out**
++   - **File:** `apps/desktop/src/components/panels/VoicePanel.tsx:57`
++   - **Issue:** `rec.onerror` only sets `recording` to false; the user gets no feedback that speech recognition failed.
++   - **Fix:** Surface an error state/message.
++
++9. **Chat input `autoFocus` steals focus when panel re-renders**
++   - **File:** `apps/desktop/src/components/panels/ChatPanel.tsx:123`
++   - **Issue:** The input has `autoFocus`, so any re-render of `ChatPanel` (e.g., streaming update) can pull focus back to the input.
++   - **Fix:** Only autofocus when the panel first mounts, or remove `autoFocus` and focus via effect on open.
++
++10. **Settings toggles use `as never` cast**
++    - **File:** `apps/desktop/src/components/panels/SettingsPanel.tsx:90,103`
++    - **Issue:** Type-unsafe cast. Works but is a code-smell and can mask type errors as settings grow.
++    - **Fix:** Make the toggle helper generic over `boolean` settings keys.
++
++### 🟢 Backend / code quality
++
++11. **`OLLAMA_HOST` is bound at module import despite comment claiming otherwise**
++    - **File:** `glassview_ai/config.py:24`
++    - **Issue:** Line 24 assigns `OLLAMA_HOST = os.environ.get(...)` at import time, contradicting the docstring. The variable is unused, so it's harmless but misleading.
++    - **Fix:** Remove the module-level binding or update the comment.
++
++12. **`app.state.ollama` is created but never used**
++    - **File:** `glassview_ai/main.py:42`
++    - **Issue:** A client is stored in lifespan but each `/chat` request creates a fresh `OllamaClient` based on the routing decision.
++    - **Fix:** Use `app.state.ollama` when `decision.model` equals the default model; only create a new client when routing picks a different model.
++
++13. **Agent loop JSON regex is greedy**
++    - **File:** `glassview_ai/agents/loop.py:16`
++    - **Issue:** `re.compile(r"\{.*\}", re.DOTALL)` matches from the first `{` to the last `}` in the output. If the model outputs explanatory text around JSON, or multiple JSON objects, parsing can fail or pick the wrong object.
++    - **Fix:** Use a non-greedy match or a proper JSON-lines/JSON-block extractor.
++
++14. **CSP is disabled (`null`) in Tauri config**
++    - **File:** `apps/desktop/src-tauri/tauri.conf.json:30`
++    - **Issue:** `"csp": null` removes content-security-policy in the bundled app.
++    - **Fix:** Set a restrictive CSP for production builds (e.g., `default-src 'self'`).
++
++15. **Window is user-resizable but app also auto-fits**
++    - **File:** `apps/desktop/src-tauri/tauri.conf.json:24`, `apps/desktop/src/lib/tauri.ts:77-110`
++    - **Issue:** `resizable: true` allows the user to resize, but `fitWindowToContent` will resize back on content changes. This can create a jarring fight.
++    - **Fix:** Set `resizable: false` since the app is intended to be content-sized.
++
++## Files read
++
++- Backend: `main.py`, `config.py`, `db.py`, `ollama_client.py`, `schemas.py`, `routing/router.py`, `ocr/fuse.py`, `agents/loop.py`, `agents/registry.py`
++- Frontend: `App.tsx`, `main.tsx`, `types.ts`, `styles/global.css`, `styles/tokens.ts`, `hooks/useChat.ts`, `hooks/useTheme.ts`, `hooks/useSettings.ts`, `hooks/useHealth.ts`, `hooks/useDrag.ts`, `api/client.ts`, `lib/tauri.ts`, `components/Pill.tsx`, `components/Toolbar.tsx`, `components/RegionSelect.tsx`, `components/Icon.tsx`, `components/icons.ts`, `components/tools.ts`, `components/panels/Panel.tsx`, `components/panels/ChatPanel.tsx`, `components/panels/HistoryPanel.tsx`, `components/panels/VoicePanel.tsx`, `components/panels/SettingsPanel.tsx`, `components/panels/ErrorPanel.tsx`
++- Native: `src-tauri/src/main.rs`, `src-tauri/src/capture.rs`, `src-tauri/src/sidecar.rs`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`
++- Docs: `README.md`, `docs/HANDOFF.md`
+diff --git a/docs/bugfix-patch-2026-06-26.patch b/docs/bugfix-patch-2026-06-26.patch
+new file mode 100644
+index 0000000..18da64d
+--- /dev/null
++++ b/docs/bugfix-patch-2026-06-26.patch
+@@ -0,0 +1,1858 @@
++From 8fb12f3af6b86fc1476298396c8f4766b0aa4290 Mon Sep 17 00:00:00 2001
++From: lichris174 <lichris174@gmail.com>
++Date: Fri, 26 Jun 2026 14:40:24 -0400
++Subject: [PATCH] bugfix: address UI/app bugs from review
++
++- useChat: avoid empty user bubble on image-only sends; keep partial text on cancel
++- main.py: persist error message instead of partial response when streaming fails
++- useSettings/types: remove dead theme field (useTheme owns theme)
++- RegionSelect: window-level mouseup so releasing outside overlay finishes drag
++- HistoryPanel: refresh when visible prop becomes true
++- VoicePanel: surface speech recognition errors
++- ChatPanel: focus input once on mount instead of autoFocus on every render
++- SettingsPanel: type-safe boolean toggle helper
++- config.py: remove misleading module-level OLLAMA_HOST binding
++- main.py: reuse lifespan OllamaClient when routing picks default model
++- agents/loop: parse balanced JSON blocks instead of greedy regex
++- tauri.conf.json: disable resizing, add restrictive CSP
++- main.rs: propagate shortcut registration errors to frontend
++---
++ apps/desktop/src-tauri/src/main.rs            |  97 ++++++
++ apps/desktop/src-tauri/tauri.conf.json        |  49 +++
++ apps/desktop/src/App.tsx                      | 317 ++++++++++++++++++
++ apps/desktop/src/components/RegionSelect.tsx  |  90 +++++
++ .../src/components/panels/ChatPanel.tsx       | 138 ++++++++
++ .../src/components/panels/HistoryPanel.tsx    |  72 ++++
++ .../src/components/panels/SettingsPanel.tsx   | 116 +++++++
++ .../src/components/panels/VoicePanel.tsx      |  98 ++++++
++ apps/desktop/src/hooks/useChat.ts             |  99 ++++++
++ apps/desktop/src/hooks/useSettings.ts         |  49 +++
++ apps/desktop/src/types.ts                     |  33 ++
++ docs/AI_SCREEN_ASSISTANT_REVIEW.md            | 109 ++++++
++ glassview_ai/agents/loop.py                   | 126 +++++++
++ glassview_ai/config.py                        | 107 ++++++
++ glassview_ai/main.py                          | 214 ++++++++++++
++ 15 files changed, 1714 insertions(+)
++ create mode 100644 apps/desktop/src-tauri/src/main.rs
++ create mode 100644 apps/desktop/src-tauri/tauri.conf.json
++ create mode 100644 apps/desktop/src/App.tsx
++ create mode 100644 apps/desktop/src/components/RegionSelect.tsx
++ create mode 100644 apps/desktop/src/components/panels/ChatPanel.tsx
++ create mode 100644 apps/desktop/src/components/panels/HistoryPanel.tsx
++ create mode 100644 apps/desktop/src/components/panels/SettingsPanel.tsx
++ create mode 100644 apps/desktop/src/components/panels/VoicePanel.tsx
++ create mode 100644 apps/desktop/src/hooks/useChat.ts
++ create mode 100644 apps/desktop/src/hooks/useSettings.ts
++ create mode 100644 apps/desktop/src/types.ts
++ create mode 100644 docs/AI_SCREEN_ASSISTANT_REVIEW.md
++ create mode 100644 glassview_ai/agents/loop.py
++ create mode 100644 glassview_ai/config.py
++ create mode 100644 glassview_ai/main.py
++
++diff --git a/apps/desktop/src-tauri/src/main.rs b/apps/desktop/src-tauri/src/main.rs
++new file mode 100644
++index 0000000..3d3353a
++--- /dev/null
+++++ b/apps/desktop/src-tauri/src/main.rs
++@@ -0,0 +1,97 @@
+++#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+++
+++//! GlassView native shell: a content-sized transparent always-on-top overlay window,
+++//! a global toggle hotkey, a system tray, ownership of the Python backend sidecar, and
+++//! the region-snip capture flow (a temporary fullscreen window).
+++
+++mod capture;
+++mod sidecar;
+++
+++use tauri::{
+++    menu::{MenuBuilder, MenuItemBuilder},
+++    tray::TrayIconBuilder,
+++    Emitter, Manager, RunEvent,
+++};
+++use tauri_plugin_global_shortcut::{Builder as GlobalShortcutBuilder, GlobalShortcutExt, ShortcutState};
+++
+++const DEFAULT_SHORTCUT: &str = "Ctrl+Shift+Space";
+++
+++fn main() {
+++    tauri::Builder::default()
+++        .plugin(GlobalShortcutBuilder::new().build())
+++        .invoke_handler(tauri::generate_handler![
+++            capture::log_frontend,
+++            capture::capture_screen,
+++            capture::arm_region_escape,
+++            capture::disarm_region_escape,
+++            register_shortcut,
+++        ])
+++        .setup(|app| {
+++            sidecar::start();
+++            if let Err(err) = register_hotkey(app.handle(), DEFAULT_SHORTCUT) {
+++                eprintln!("[setup] default hotkey unavailable: {err}");
+++            }
+++            build_tray(app.handle())?;
+++            Ok(())
+++        })
+++        .build(tauri::generate_context!())
+++        .expect("error while building tauri application")
+++        .run(|_app, event| {
+++            if let RunEvent::Exit = event {
+++                sidecar::stop();
+++            }
+++        });
+++}
+++
+++/// Re-register the global hotkey to a new accelerator (called from Settings).
+++/// Returns an error if the accelerator string is invalid so the UI can warn the user.
+++#[tauri::command]
+++fn register_shortcut(app: tauri::AppHandle, accelerator: String) -> Result<(), String> {
+++    app.global_shortcut().unregister_all().ok();
+++    register_hotkey(&app, &accelerator)
+++}
+++
+++/// Bind `accelerator` to toggle the overlay: surface the window and emit `toggle-overlay`
+++/// so the frontend expands/collapses the toolbar.
+++fn register_hotkey(app: &tauri::AppHandle, accelerator: &str) -> Result<(), String> {
+++    let handle = app.clone();
+++    app.global_shortcut()
+++        .on_shortcut(accelerator, move |_app, _sc, event| {
+++            if event.state != ShortcutState::Pressed {
+++                return;
+++            }
+++            if let Some(main) = handle.get_webview_window("main") {
+++                let _ = main.show();
+++                let _ = main.set_focus();
+++                let _ = main.emit("toggle-overlay", ());
+++            }
+++        })
+++        .map_err(|err| {
+++            eprintln!("[hotkey] failed to register {accelerator}: {err}");
+++            format!("{err}")
+++        })
+++}
+++
+++/// System tray with Show / Quit.
+++fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+++    let show = MenuItemBuilder::with_id("show", "Show GlassView").build(app)?;
+++    let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+++    let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
+++
+++    TrayIconBuilder::new()
+++        .icon(app.default_window_icon().unwrap().clone())
+++        .tooltip("GlassView")
+++        .menu(&menu)
+++        .on_menu_event(|app, event| match event.id().as_ref() {
+++            "show" => {
+++                if let Some(main) = app.get_webview_window("main") {
+++                    let _ = main.show();
+++                    let _ = main.set_focus();
+++                }
+++            }
+++            "quit" => app.exit(0),
+++            _ => {}
+++        })
+++        .build(app)?;
+++    Ok(())
+++}
++diff --git a/apps/desktop/src-tauri/tauri.conf.json b/apps/desktop/src-tauri/tauri.conf.json
++new file mode 100644
++index 0000000..9520c85
++--- /dev/null
+++++ b/apps/desktop/src-tauri/tauri.conf.json
++@@ -0,0 +1,49 @@
+++{
+++  "$schema": "https://schema.tauri.app/config/2",
+++  "productName": "GlassView",
+++  "version": "0.1.0",
+++  "identifier": "com.glassview.desktop",
+++  "build": {
+++    "beforeDevCommand": "npm run dev",
+++    "devUrl": "http://localhost:1420",
+++    "beforeBuildCommand": "npm run build",
+++    "frontendDist": "../dist"
+++  },
+++  "app": {
+++    "withGlobalTauri": true,
+++    "windows": [
+++      {
+++        "label": "main",
+++        "title": "GlassView",
+++        "width": 360,
+++        "height": 480,
+++        "transparent": true,
+++        "decorations": false,
+++        "alwaysOnTop": true,
+++        "skipTaskbar": true,
+++        "resizable": false,
+++        "shadow": false,
+++        "visible": true
+++      }
+++    ],
+++    "security": {
+++      "csp": {
+++        "default-src": "'self'",
+++        "connect-src": "'self' http://127.0.0.1:8765",
+++        "img-src": "'self' data: blob:",
+++        "style-src": "'self' 'unsafe-inline'"
+++      }
+++    }
+++  },
+++  "bundle": {
+++    "active": true,
+++    "targets": "all",
+++    "icon": [
+++      "icons/32x32.png",
+++      "icons/128x128.png",
+++      "icons/128x128@2x.png",
+++      "icons/icon.icns",
+++      "icons/icon.ico"
+++    ]
+++  }
+++}
++diff --git a/apps/desktop/src/App.tsx b/apps/desktop/src/App.tsx
++new file mode 100644
++index 0000000..93a0348
++--- /dev/null
+++++ b/apps/desktop/src/App.tsx
++@@ -0,0 +1,317 @@
+++import { useCallback, useEffect, useRef, useState } from "react";
+++import { Pill } from "./components/Pill";
+++import { TOOLS } from "./components/tools";
+++import { Panel } from "./components/panels/Panel";
+++import { ChatPanel } from "./components/panels/ChatPanel";
+++import { HistoryPanel } from "./components/panels/HistoryPanel";
+++import { SettingsPanel } from "./components/panels/SettingsPanel";
+++import { ErrorPanel } from "./components/panels/ErrorPanel";
+++import { VoicePanel } from "./components/panels/VoicePanel";
+++import { RegionSelect } from "./components/RegionSelect";
+++import { useDrag } from "./hooks/useDrag";
+++import { useTheme } from "./hooks/useTheme";
+++import { useHealth } from "./hooks/useHealth";
+++import { useSettings } from "./hooks/useSettings";
+++import { useChat } from "./hooks/useChat";
+++import {
+++  isTauri, startDragging, fitWindowToContent, registerShortcut, watchWindowMoves,
+++  onToggleOverlay, onRegionCancel, captureScreen, setFullscreen,
+++  armRegionEscape, disarmRegionEscape,
+++} from "./lib/tauri";
+++import type { ToolId } from "./types";
+++
+++const TITLES: Record<ToolId, string> = {
+++  chat: "Chat",
+++  region: "Region",
+++  voice: "Voice",
+++  history: "Past Chats",
+++  settings: "Settings",
+++};
+++
+++const TAURI = isTauri();
+++
+++export default function App() {
+++  const { theme, setTheme } = useTheme();
+++  const { settings, update, apiKey, setApiKey } = useSettings();
+++  const { model, error: healthError } = useHealth();
+++
+++  const [expanded, setExpanded] = useState(false);
+++  const [activeTool, setActiveTool] = useState<ToolId | null>(null);
+++  const [hasNotif, setHasNotif] = useState(false);
+++  const [regionImage, setRegionImage] = useState<string | null>(null);
+++  const activeRef = useRef<ToolId | null>(null);
+++  activeRef.current = activeTool;
+++  const wrapRef = useRef<HTMLDivElement>(null);
+++
+++  const chat = useChat(() => {
+++    if (activeRef.current !== "chat") setHasNotif(true);
+++  });
+++  const chatRef = useRef(chat);
+++  chatRef.current = chat;
+++
+++  const { pos, moved, onMouseDown: jsDrag } = useDrag({
+++    x: window.innerWidth - 220,
+++    y: window.innerHeight - 80,
+++  });
+++
+++  useEffect(() => {
+++    document.body.dataset.stage = TAURI ? "tauri" : "dev";
+++  }, []);
+++
+++  // Keep the window anchor synced to user drags.
+++  useEffect(() => {
+++    if (!TAURI) return;
+++    let un: (() => void) | undefined;
+++    watchWindowMoves().then((u) => { un = u; });
+++    return () => un?.();
+++  }, []);
+++
+++  // Native window: fit to content (logo anchored) whenever the toolbar/panel open or
+++  // their content grows. The panel is out of flow, so re-run on expanded/activeTool and
+++  // observe both the pill and the panel for streaming/content growth.
+++  useEffect(() => {
+++    if (!TAURI || regionImage) return; // don't resize while fullscreen for region
+++    const wrap = wrapRef.current;
+++    if (!wrap) return;
+++    let raf = 0;
+++    let timer = 0;
+++    const fit = () => fitWindowToContent(wrap);
+++    const ro = new ResizeObserver(() => {
+++      cancelAnimationFrame(raf);
+++      clearTimeout(timer);
+++      // Coalesce rapid frames (CSS animation) into one call at the end
+++      timer = window.setTimeout(() => { raf = requestAnimationFrame(fit); }, 32);
+++    });
+++    wrap.querySelectorAll(".gv-pill, .gv-panel").forEach((el) => ro.observe(el));
+++    requestAnimationFrame(fit);
+++    return () => { ro.disconnect(); clearTimeout(timer); cancelAnimationFrame(raf); };
+++  }, [expanded, activeTool, regionImage]);
+++
+++  // Rebind the global shortcut when it changes (native only).
+++  useEffect(() => {
+++    if (TAURI) {
+++      registerShortcut(settings.shortcut).catch((err) => {
+++        console.error("[shortcut] failed to register:", err);
+++      });
+++    }
+++  }, [settings.shortcut]);
+++
+++  // Leave region mode: drop fullscreen, disarm the Esc failsafe, clear the capture.
+++  const exitRegion = useCallback(() => {
+++    setRegionImage(null);
+++    disarmRegionEscape().catch(() => {});
+++    setFullscreen(false).catch(() => {});
+++  }, []);
+++  const exitRegionRef = useRef(exitRegion);
+++  exitRegionRef.current = exitRegion;
+++
+++  // Events from Rust: hotkey toggle + region force-cancel failsafe.
+++  useEffect(() => {
+++    const uns: Array<() => void> = [];
+++    onToggleOverlay(() => {
+++      setExpanded((e) => !e);
+++      setHasNotif(false);
+++    }).then((u) => uns.push(u));
+++    onRegionCancel(() => exitRegionRef.current()).then((u) => uns.push(u));
+++    return () => uns.forEach((u) => u());
+++  }, []);
+++
+++  // Enter region mode: capture the screen, go fullscreen, arm the Esc failsafe, then
+++  // render the selector inside this (working) window.
+++  const startRegion = useCallback(async () => {
+++    if (!TAURI) return;
+++    try {
+++      const img = await captureScreen();
+++      if (!img) return;
+++      setActiveTool(null);
+++      setRegionImage(img);
+++      await setFullscreen(true);
+++      await armRegionEscape();
+++    } catch {
+++      exitRegionRef.current();
+++    }
+++  }, []);
+++
+++  const toggleTool = useCallback(
+++    (id: ToolId) => {
+++      if (id === "region") {
+++        setActiveTool(null);
+++        startRegion();
+++        return;
+++      }
+++      setActiveTool((prev) => (prev === id ? null : id));
+++    },
+++    [startRegion],
+++  );
+++
+++  const toggleExpand = useCallback(() => {
+++    setExpanded((e) => {
+++      if (e) setActiveTool(null);
+++      return !e;
+++    });
+++    setHasNotif(false);
+++  }, []);
+++
+++  const onLogoClick = useCallback(() => {
+++    // Native: the click is decided in onDragMouseDown's mouseup (startDragging would
+++    // otherwise eat the click), so this is a no-op there.
+++    if (TAURI) return;
+++    if (moved.current) {
+++      moved.current = false;
+++      return;
+++    }
+++    toggleExpand();
+++  }, [moved, toggleExpand]);
+++
+++  const onDragMouseDown = useCallback(
+++    (e: React.MouseEvent) => {
+++      if (!TAURI) {
+++        jsDrag(e);
+++        return;
+++      }
+++      if (e.button !== 0) return;
+++      // Hand off to the OS window drag only once the press moves past a threshold;
+++      // a release without movement counts as a click and toggles the toolbar.
+++      const sx = e.clientX;
+++      const sy = e.clientY;
+++      let dragged = false;
+++      const cleanup = () => {
+++        window.removeEventListener("mousemove", move);
+++        window.removeEventListener("mouseup", up);
+++      };
+++      const move = (ev: MouseEvent) => {
+++        if (!dragged && (Math.abs(ev.clientX - sx) > 4 || Math.abs(ev.clientY - sy) > 4)) {
+++          dragged = true;
+++          cleanup();
+++          startDragging();
+++        }
+++      };
+++      const up = () => {
+++        cleanup();
+++        if (!dragged) toggleExpand();
+++      };
+++      window.addEventListener("mousemove", move);
+++      window.addEventListener("mouseup", up);
+++    },
+++    [jsDrag, toggleExpand],
+++  );
+++
+++  const closePanel = useCallback(() => setActiveTool(null), []);
+++
+++  useEffect(() => {
+++    const handler = (e: KeyboardEvent) => {
+++      if (!expanded) return;
+++      if (e.target instanceof HTMLElement && e.target.tagName === "INPUT") return;
+++      if (e.key === "Escape") return setActiveTool(null);
+++      const tool = TOOLS.find((t) => t.kbd === e.key.toUpperCase());
+++      if (tool) {
+++        e.preventDefault();
+++        toggleTool(tool.id);
+++      }
+++    };
+++    window.addEventListener("keydown", handler);
+++    return () => window.removeEventListener("keydown", handler);
+++  }, [expanded, toggleTool]);
+++
+++  useEffect(() => {
+++    if (!activeTool || !settings.closeOnBlur) return;
+++    const handler = (e: MouseEvent) => {
+++      if (e.target instanceof HTMLElement && !e.target.closest(".gv-wrap")) {
+++        setActiveTool(null);
+++      }
+++    };
+++    window.addEventListener("mousedown", handler);
+++    return () => window.removeEventListener("mousedown", handler);
+++  }, [activeTool, settings.closeOnBlur]);
+++
+++  // Region Esc (webview-side; the Rust global Esc is the failsafe if this is frozen).
+++  useEffect(() => {
+++    if (!regionImage) return;
+++    const onKey = (e: KeyboardEvent) => {
+++      if (e.key === "Escape") exitRegion();
+++    };
+++    window.addEventListener("keydown", onKey);
+++    return () => window.removeEventListener("keydown", onKey);
+++  }, [regionImage, exitRegion]);
+++
+++  const onRegionDone = useCallback((cropped: string) => {
+++    exitRegion();
+++    setExpanded(true);
+++    setActiveTool("chat");
+++    chatRef.current.send("What's in this region?", cropped);
+++  }, [exitRegion]);
+++
+++  const openHistoryChat = useCallback((id: string) => {
+++    chatRef.current.load(id);
+++    setActiveTool("chat");
+++  }, []);
+++
+++  const renderPanel = () => {
+++    if (!activeTool) return null;
+++    if (activeTool === "chat" && healthError) {
+++      return (
+++        <Panel title={TITLES.chat} onClose={closePanel}>
+++          <ErrorPanel onOpenSettings={() => setActiveTool("settings")} />
+++        </Panel>
+++      );
+++    }
+++    return (
+++      <Panel title={TITLES[activeTool]} onClose={closePanel}>
+++        {activeTool === "chat" && (
+++          <ChatPanel
+++            messages={chat.messages}
+++            thinking={chat.thinking}
+++            streaming={chat.streaming}
+++            streamText={chat.streamText}
+++            busy={chat.busy}
+++            onSend={chat.send}
+++          />
+++        )}
+++        {activeTool === "history" && <HistoryPanel onOpen={openHistoryChat} visible={activeTool === "history"} />}
+++        {activeTool === "voice" && (
+++          <VoicePanel
+++            onTranscript={(text) => {
+++              setActiveTool("chat");
+++              chat.send(text);
+++            }}
+++          />
+++        )}
+++        {activeTool === "settings" && (
+++          <SettingsPanel
+++            settings={settings}
+++            update={update}
+++            theme={theme}
+++            setTheme={setTheme}
+++            apiKey={apiKey}
+++            setApiKey={setApiKey}
+++            model={model}
+++          />
+++        )}
+++      </Panel>
+++    );
+++  };
+++
+++  // Browser: float at the JS-drag position. Native: pin bottom-right of the fitted window.
+++  const wrapStyle: React.CSSProperties = TAURI
+++    ? { position: "fixed", right: 0, bottom: 0 }
+++    : { position: "fixed", left: pos.x, top: pos.y };
+++
+++  return (
+++    <>
+++      {regionImage && (
+++        <RegionSelect image={regionImage} onDone={onRegionDone} onCancel={exitRegion} />
+++      )}
+++      <div className="gv-wrap" ref={wrapRef} style={wrapStyle}>
+++        {renderPanel()}
+++        <Pill
+++          expanded={expanded}
+++          activeTool={activeTool}
+++          hasNotif={hasNotif}
+++          onLogoClick={onLogoClick}
+++          onToggleTool={toggleTool}
+++          onDragMouseDown={onDragMouseDown}
+++        />
+++      </div>
+++    </>
+++  );
+++}
++diff --git a/apps/desktop/src/components/RegionSelect.tsx b/apps/desktop/src/components/RegionSelect.tsx
++new file mode 100644
++index 0000000..a036f14
++--- /dev/null
+++++ b/apps/desktop/src/components/RegionSelect.tsx
++@@ -0,0 +1,90 @@
+++import { useEffect, useRef, useState } from "react";
+++
+++interface Box { x: number; y: number; w: number; h: number; }
+++
+++interface RegionSelectProps {
+++  image: string; // PNG data URL of the full screen (physical pixels)
+++  onDone: (croppedDataUrl: string) => void;
+++  onCancel: () => void;
+++}
+++
+++/**
+++ * Fullscreen region selector rendered inside the MAIN window. Shows the captured screen,
+++ * lets the user drag a rectangle, and crops it client-side with a canvas (handling the
+++ * HiDPI scale between CSS pixels and the physical capture). Escapable via the Cancel
+++ * button, the parent's Esc handler, and the Rust global-Escape failsafe.
+++ */
+++export function RegionSelect({ image, onDone, onCancel }: RegionSelectProps) {
+++  const [box, setBox] = useState<Box | null>(null);
+++  const [dragging, setDragging] = useState(false);
+++  const start = useRef<{ x: number; y: number } | null>(null);
+++  const imgRef = useRef<HTMLImageElement>(null);
+++  // Mirror of `box` so the window-level mouseup listener always sees the latest selection.
+++  const boxRef = useRef<Box | null>(null);
+++  boxRef.current = box;
+++
+++  const crop = (b: Box) => {
+++    const img = imgRef.current;
+++    if (!img || !img.naturalWidth) return onCancel();
+++    const sx = img.naturalWidth / window.innerWidth;
+++    const sy = img.naturalHeight / window.innerHeight;
+++    const cw = Math.max(1, Math.round(b.w * sx));
+++    const ch = Math.max(1, Math.round(b.h * sy));
+++    const canvas = document.createElement("canvas");
+++    canvas.width = cw;
+++    canvas.height = ch;
+++    const ctx = canvas.getContext("2d");
+++    if (!ctx) return onCancel();
+++    ctx.drawImage(img, b.x * sx, b.y * sy, cw, ch, 0, 0, cw, ch);
+++    onDone(canvas.toDataURL("image/png"));
+++  };
+++
+++  const finishDrag = () => {
+++    setDragging(false);
+++    const b = boxRef.current;
+++    if (b && b.w > 8 && b.h > 8) crop(b);
+++    else setBox(null);
+++  };
+++
+++  const onDown = (e: React.MouseEvent) => {
+++    if ((e.target as HTMLElement).closest(".region-cancel")) return;
+++    start.current = { x: e.clientX, y: e.clientY };
+++    setDragging(true);
+++    setBox({ x: e.clientX, y: e.clientY, w: 0, h: 0 });
+++  };
+++  const onMove = (e: React.MouseEvent) => {
+++    if (!dragging || !start.current) return;
+++    const s = start.current;
+++    setBox({
+++      x: Math.min(e.clientX, s.x),
+++      y: Math.min(e.clientY, s.y),
+++      w: Math.abs(e.clientX - s.x),
+++      h: Math.abs(e.clientY - s.y),
+++    });
+++  };
+++
+++  // Capture mouseup at the window level so releasing outside the overlay still
+++  // finishes the selection (the Rust global Escape remains the ultimate failsafe).
+++  useEffect(() => {
+++    if (!dragging) return;
+++    window.addEventListener("mouseup", finishDrag);
+++    return () => window.removeEventListener("mouseup", finishDrag);
+++  }, [dragging]);
+++
+++  return (
+++    <div className="region-overlay" onMouseDown={onDown} onMouseMove={onMove}>
+++      <img ref={imgRef} className="region-shot" src={image} alt="" />
+++      <div className="region-bg" />
+++      {!dragging && !box && (
+++        <div className="region-hint">
+++          <div className="region-hint-t">Select a region</div>
+++          <div className="region-hint-s">Click and drag · Esc to cancel</div>
+++        </div>
+++      )}
+++      {box && box.w > 2 && (
+++        <div className="region-sel" style={{ left: box.x, top: box.y, width: box.w, height: box.h }} />
+++      )}
+++      <button className="region-cancel" onClick={onCancel}>Cancel — esc</button>
+++    </div>
+++  );
+++}
++diff --git a/apps/desktop/src/components/panels/ChatPanel.tsx b/apps/desktop/src/components/panels/ChatPanel.tsx
++new file mode 100644
++index 0000000..8e77f22
++--- /dev/null
+++++ b/apps/desktop/src/components/panels/ChatPanel.tsx
++@@ -0,0 +1,138 @@
+++import { useEffect, useRef, useState } from "react";
+++import { Icon } from "../Icon";
+++import { Icons } from "../icons";
+++import type { Message } from "../../types";
+++
+++interface ChatPanelProps {
+++  messages: Message[];
+++  thinking: boolean;
+++  streaming: boolean;
+++  streamText: string;
+++  busy: boolean;
+++  onSend: (text: string, image?: string) => void;
+++}
+++
+++/** Read a File as a data URL (base64) for the /chat image field. */
+++function readAsDataUrl(file: File): Promise<string> {
+++  return new Promise((resolve, reject) => {
+++    const r = new FileReader();
+++    r.onload = () => resolve(r.result as string);
+++    r.onerror = reject;
+++    r.readAsDataURL(file);
+++  });
+++}
+++
+++export function ChatPanel({ messages, thinking, streaming, streamText, busy, onSend }: ChatPanelProps) {
+++  const [input, setInput] = useState("");
+++  const [attached, setAttached] = useState<{ name: string; dataUrl: string } | null>(null);
+++  const [dropOver, setDropOver] = useState(false);
+++  const msgsRef = useRef<HTMLDivElement>(null);
+++  const fileRef = useRef<HTMLInputElement>(null);
+++  const inputRef = useRef<HTMLInputElement>(null);
+++
+++  useEffect(() => {
+++    if (msgsRef.current) msgsRef.current.scrollTop = msgsRef.current.scrollHeight;
+++  }, [messages, streamText, thinking]);
+++
+++  // Focus the input once when the panel opens, without autoFocus stealing focus
+++  // on every parent re-render during streaming.
+++  useEffect(() => {
+++    inputRef.current?.focus();
+++  }, []);
+++
+++  const attach = async (file: File | undefined) => {
+++    if (!file) return;
+++    setAttached({ name: file.name, dataUrl: await readAsDataUrl(file) });
+++  };
+++
+++  const send = () => {
+++    if ((!input.trim() && !attached) || busy) return;
+++    onSend(input, attached?.dataUrl);
+++    setInput("");
+++    setAttached(null);
+++  };
+++
+++  const hasThread = messages.length > 0 || thinking || streaming;
+++
+++  return (
+++    <>
+++      {/* Context strip — placeholder until live window-context capture lands. */}
+++      <div className="gv-ctx">
+++        <div className="gv-ctx-thumb">
+++          {[90, 70, 85, 60, 75].map((w, i) => (
+++            <div key={i} className="gv-ctx-line" style={{ width: `${w}%` }} />
+++          ))}
+++        </div>
+++        <div className="gv-ctx-meta">
+++          <div className="gv-ctx-app">No context captured</div>
+++          <div className="gv-ctx-sub">Attach a file or use Region</div>
+++        </div>
+++      </div>
+++
+++      {/* File drop / attach */}
+++      <div
+++        className={`gv-drop${dropOver ? " over" : ""}`}
+++        onDragOver={(e) => { e.preventDefault(); setDropOver(true); }}
+++        onDragLeave={() => setDropOver(false)}
+++        onDrop={(e) => { e.preventDefault(); setDropOver(false); attach(e.dataTransfer.files?.[0]); }}
+++        onClick={() => fileRef.current?.click()}
+++      >
+++        <Icon d={Icons.attach} size={13} stroke={attached ? "#3BAAFF" : "var(--gv-textFaint)"} sw={1.4} />
+++        {attached ? (
+++          <div className="gv-file-chip">
+++            {attached.name}
+++            <button className="gv-file-rm" onClick={(e) => { e.stopPropagation(); setAttached(null); }}>✕</button>
+++          </div>
+++        ) : (
+++          <span className="gv-drop-label">Drop a file or <span>click to attach</span></span>
+++        )}
+++        <input
+++          ref={fileRef}
+++          type="file"
+++          hidden
+++          onChange={(e) => attach(e.target.files?.[0] ?? undefined)}
+++        />
+++      </div>
+++
+++      {hasThread && (
+++        <div className="gv-msgs" ref={msgsRef}>
+++          {messages.map((m, i) => (
+++            <div key={i} className={`gv-msg gv-msg-${m.role === "user" ? "u" : "a"}`}>
+++              <div className={`gv-bubble gv-bubble-${m.role === "user" ? "u" : "a"}`}>{m.text}</div>
+++            </div>
+++          ))}
+++          {thinking && (
+++            <div className="gv-msg gv-msg-a">
+++              <div className="gv-bubble gv-bubble-a">
+++                <div className="thinking-dots"><div className="td" /><div className="td" /><div className="td" /></div>
+++              </div>
+++            </div>
+++          )}
+++          {streaming && streamText && (
+++            <div className="gv-msg gv-msg-a">
+++              <div className="gv-bubble gv-bubble-a">{streamText}<span className="gv-cursor" /></div>
+++            </div>
+++          )}
+++        </div>
+++      )}
+++
+++      <div className="gv-input-row">
+++        <button className="gv-attach-btn" onClick={() => fileRef.current?.click()}>
+++          <Icon d={Icons.attach} size={13} sw={1.4} />
+++        </button>
+++        <input
+++          ref={inputRef}
+++          className="gv-input"
+++          placeholder="Ask about your screen…"
+++          value={input}
+++          onChange={(e) => setInput(e.target.value)}
+++          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+++          disabled={busy}
+++        />
+++        <button className="gv-send" onClick={send} disabled={(!input.trim() && !attached) || busy}>
+++          <Icon d={Icons.send} size={13} stroke="white" sw={1.8} />
+++        </button>
+++      </div>
+++    </>
+++  );
+++}
++diff --git a/apps/desktop/src/components/panels/HistoryPanel.tsx b/apps/desktop/src/components/panels/HistoryPanel.tsx
++new file mode 100644
++index 0000000..908ea3d
++--- /dev/null
+++++ b/apps/desktop/src/components/panels/HistoryPanel.tsx
++@@ -0,0 +1,72 @@
+++import { useEffect, useMemo, useState } from "react";
+++import { api, type ChatSummary } from "../../api/client";
+++
+++interface HistoryPanelProps {
+++  onOpen: (chatId: string) => void;
+++  visible: boolean;
+++}
+++
+++/** Relative "2m ago" / "3h ago" from an ISO/SQL timestamp. */
+++function relTime(ts: string | null): string {
+++  if (!ts) return "";
+++  const then = new Date(ts.includes("T") ? ts : ts.replace(" ", "T") + "Z").getTime();
+++  if (Number.isNaN(then)) return "";
+++  const s = Math.max(0, (Date.now() - then) / 1000);
+++  if (s < 60) return "just now";
+++  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+++  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+++  if (s < 172800) return "Yesterday";
+++  return `${Math.floor(s / 86400)}d ago`;
+++}
+++
+++export function HistoryPanel({ onOpen, visible }: HistoryPanelProps) {
+++  const [chats, setChats] = useState<ChatSummary[]>([]);
+++  const [query, setQuery] = useState("");
+++  const [loading, setLoading] = useState(true);
+++
+++  useEffect(() => {
+++    if (!visible) return;
+++    let alive = true;
+++    setLoading(true);
+++    api
+++      .listChats()
+++      .then((r) => alive && setChats(r.chats))
+++      .catch(() => alive && setChats([]))
+++      .finally(() => alive && setLoading(false));
+++    return () => { alive = false; };
+++  }, [visible]);
+++
+++  const filtered = useMemo(() => {
+++    const q = query.toLowerCase();
+++    return chats.filter((c) => c.title.toLowerCase().includes(q));
+++  }, [chats, query]);
+++
+++  return (
+++    <>
+++      <input
+++        className="gv-hist-search"
+++        placeholder="Search past chats…"
+++        value={query}
+++        onChange={(e) => setQuery(e.target.value)}
+++        autoFocus
+++      />
+++      <div className="gv-hist-list">
+++        {loading ? (
+++          <div className="gv-hist-empty">Loading…</div>
+++        ) : filtered.length === 0 ? (
+++          <div className="gv-hist-empty">{chats.length === 0 ? "No chats yet" : "No matches"}</div>
+++        ) : (
+++          filtered.map((c) => (
+++            <div key={c.id} className="gv-hist-item" onClick={() => onOpen(c.id)}>
+++              <div className="gv-hist-row">
+++                <span className="gv-hist-title">{c.title || "Untitled"}</span>
+++                <span className="gv-hist-time">{relTime(c.updated_at)}</span>
+++              </div>
+++              <div className="gv-hist-preview">{c.message_count} messages</div>
+++            </div>
+++          ))
+++        )}
+++      </div>
+++    </>
+++  );
+++}
++diff --git a/apps/desktop/src/components/panels/SettingsPanel.tsx b/apps/desktop/src/components/panels/SettingsPanel.tsx
++new file mode 100644
++index 0000000..5b3caf9
++--- /dev/null
+++++ b/apps/desktop/src/components/panels/SettingsPanel.tsx
++@@ -0,0 +1,116 @@
+++import { detectProvider } from "../../hooks/useSettings";
+++import type { Settings, ThemeName } from "../../types";
+++
+++interface SettingsPanelProps {
+++  settings: Settings;
+++  update: <K extends keyof Settings>(key: K, value: Settings[K]) => void;
+++  theme: ThemeName;
+++  setTheme: (t: ThemeName) => void;
+++  apiKey: string;
+++  setApiKey: (k: string) => void;
+++  model: string | null;
+++}
+++
+++type BooleanSettingKey = {
+++  [K in keyof Settings]: Settings[K] extends boolean ? K : never;
+++}[keyof Settings];
+++
+++const BEHAVIOR: [string, BooleanSettingKey][] = [
+++  ["Close on click outside", "closeOnBlur"],
+++  ["Auto-launch on login", "autoLaunch"],
+++  ["Stream responses", "streaming"],
+++];
+++const PRIVACY: [string, BooleanSettingKey][] = [
+++  ["Privacy redaction", "privacy"],
+++  ["Auto-capture context", "autoContext"],
+++];
+++
+++export function SettingsPanel({ settings, update, theme, setTheme, apiKey, setApiKey, model }: SettingsPanelProps) {
+++  const provider = detectProvider(apiKey);
+++  const providerLabel = provider === "ollama" ? "Ollama" : provider === "openai" ? "OpenAI" : "Anthropic";
+++
+++  const toggle = (key: BooleanSettingKey) => update(key, !settings[key]);
+++
+++  return (
+++    <div className="gv-settings">
+++      <div className="gv-sg">
+++        <div className="gv-sg-label">Appearance</div>
+++        <div className="gv-sr">
+++          <span className="gv-sr-name">Theme</span>
+++          <div style={{ display: "flex", gap: 6 }}>
+++            {(["dark", "light"] as ThemeName[]).map((th) => (
+++              <button
+++                key={th}
+++                className={`gv-theme-btn${theme === th ? " on" : ""}`}
+++                onClick={() => setTheme(th)}
+++              >
+++                {th === "dark" ? "Dark" : "Light"}
+++              </button>
+++            ))}
+++          </div>
+++        </div>
+++      </div>
+++
+++      <div className="gv-sg">
+++        <div className="gv-sg-label">Model</div>
+++        <div className="gv-sr" style={{ flexDirection: "column", alignItems: "stretch", gap: 8 }}>
+++          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+++            <span className="gv-sr-name">API Key</span>
+++            <span className={`gv-api-badge ${provider}`}>{providerLabel}</span>
+++          </div>
+++          <input
+++            className="gv-api-input"
+++            type="password"
+++            placeholder="sk-… or sk-ant-… or leave blank for Ollama"
+++            value={apiKey}
+++            onChange={(e) => setApiKey(e.target.value)}
+++          />
+++        </div>
+++        {provider === "ollama" && (
+++          <div className="gv-sr">
+++            <span className="gv-sr-name">Ollama model</span>
+++            <span className="gv-sr-val">{model ?? "not detected"}</span>
+++          </div>
+++        )}
+++      </div>
+++
+++      <div className="gv-sg">
+++        <div className="gv-sg-label">Shortcut</div>
+++        <div className="gv-sr">
+++          <span className="gv-sr-name">Global trigger</span>
+++          <input
+++            className="gv-kbd-input"
+++            value={settings.shortcut}
+++            onChange={(e) => update("shortcut", e.target.value)}
+++          />
+++        </div>
+++      </div>
+++
+++      <div className="gv-sg">
+++        <div className="gv-sg-label">Behavior</div>
+++        {BEHAVIOR.map(([label, key]) => (
+++          <div key={key} className="gv-sr">
+++            <span className="gv-sr-name">{label}</span>
+++            <button
+++              className={`gv-toggle${settings[key] ? " on" : ""}`}
+++              onClick={() => toggle(key)}
+++            />
+++          </div>
+++        ))}
+++      </div>
+++
+++      <div className="gv-sg">
+++        <div className="gv-sg-label">Privacy</div>
+++        {PRIVACY.map(([label, key]) => (
+++          <div key={key} className="gv-sr">
+++            <span className="gv-sr-name">{label}</span>
+++            <button
+++              className={`gv-toggle${settings[key] ? " on" : ""}`}
+++              onClick={() => toggle(key)}
+++            />
+++          </div>
+++        ))}
+++      </div>
+++    </div>
+++  );
+++}
++diff --git a/apps/desktop/src/components/panels/VoicePanel.tsx b/apps/desktop/src/components/panels/VoicePanel.tsx
++new file mode 100644
++index 0000000..3a1d4c2
++--- /dev/null
+++++ b/apps/desktop/src/components/panels/VoicePanel.tsx
++@@ -0,0 +1,98 @@
+++import { useEffect, useRef, useState } from "react";
+++import { Icon } from "../Icon";
+++import { Icons } from "../icons";
+++
+++interface VoicePanelProps {
+++  onTranscript: (text: string) => void;
+++}
+++
+++// Minimal shape of the Web Speech API we use (not in the standard TS lib).
+++type SpeechRec = {
+++  lang: string;
+++  interimResults: boolean;
+++  continuous: boolean;
+++  onresult: (e: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void;
+++  onend: () => void;
+++  onerror: (e: { error?: string; message?: string }) => void;
+++  start: () => void;
+++  stop: () => void;
+++};
+++
+++function getRecognizer(): SpeechRec | null {
+++  const w = window as unknown as { SpeechRecognition?: new () => SpeechRec; webkitSpeechRecognition?: new () => SpeechRec };
+++  const Ctor = w.SpeechRecognition ?? w.webkitSpeechRecognition;
+++  return Ctor ? new Ctor() : null;
+++}
+++
+++export function VoicePanel({ onTranscript }: VoicePanelProps) {
+++  const [recording, setRecording] = useState(false);
+++  const [transcript, setTranscript] = useState("");
+++  const [supported, setSupported] = useState(true);
+++  const [error, setError] = useState<string | null>(null);
+++  const recRef = useRef<SpeechRec | null>(null);
+++
+++  useEffect(() => {
+++    return () => recRef.current?.stop();
+++  }, []);
+++
+++  const toggle = () => {
+++    if (recording) {
+++      recRef.current?.stop();
+++      return;
+++    }
+++    const rec = getRecognizer();
+++    if (!rec) {
+++      setSupported(false);
+++      return;
+++    }
+++    rec.lang = "en-US";
+++    rec.interimResults = true;
+++    rec.continuous = false;
+++    let finalText = "";
+++    rec.onresult = (e) => {
+++      let text = "";
+++      for (let i = 0; i < e.results.length; i++) text += e.results[i][0].transcript;
+++      finalText = text;
+++      setTranscript(text);
+++      setError(null);
+++    };
+++    rec.onerror = (e: { error?: string; message?: string }) => {
+++      setRecording(false);
+++      setError(e.message || e.error || "Voice recognition failed. Try again.");
+++    };
+++    rec.onend = () => {
+++      setRecording(false);
+++      const t = finalText.trim();
+++      if (t) {
+++        setError(null);
+++        onTranscript(t);
+++      }
+++    };
+++    recRef.current = rec;
+++    setTranscript("");
+++    setError(null);
+++    setRecording(true);
+++    rec.start();
+++  };
+++
+++  if (!supported) {
+++    return <div className="gv-hist-empty">Voice input isn't supported in this runtime.</div>;
+++  }
+++
+++  return (
+++    <div className="gv-voice">
+++      <div className="voice-ring">
+++        {recording && (
+++          <>
+++            <div className="vring" /><div className="vring" /><div className="vring" />
+++          </>
+++        )}
+++        <button className={`voice-btn${recording ? " rec" : ""}`} onClick={toggle}>
+++          <Icon d={Icons.mic} size={22} stroke="currentColor" sw={1.5} />
+++        </button>
+++      </div>
+++      <div className="voice-transcript">{transcript || (recording ? "Listening…" : "Tap to speak")}</div>
+++      <div className="voice-label">{error ? error : recording ? "Recording — tap to stop" : "Voice input"}</div>
+++    </div>
+++  );
+++}
++diff --git a/apps/desktop/src/hooks/useChat.ts b/apps/desktop/src/hooks/useChat.ts
++new file mode 100644
++index 0000000..45d4872
++--- /dev/null
+++++ b/apps/desktop/src/hooks/useChat.ts
++@@ -0,0 +1,99 @@
+++import { useCallback, useRef, useState } from "react";
+++import { api, type ApiMessage } from "../api/client";
+++import type { Message } from "../types";
+++
+++function toUiMessages(msgs: ApiMessage[]): Message[] {
+++  return msgs
+++    .filter((m) => m.role === "user" || m.role === "assistant")
+++    .map((m) => ({ role: m.role as Message["role"], text: m.content }));
+++}
+++
+++/**
+++ * Owns one conversation: lazily creates a chat_id, sends turns to the streaming /chat
+++ * endpoint, and exposes the running transcript + thinking/streaming flags. onDone fires
+++ * when an assistant turn finishes (used to raise the collapsed-notif pulse).
+++ */
+++export function useChat(onDone?: () => void) {
+++  const [chatId, setChatId] = useState<string | null>(null);
+++  const [messages, setMessages] = useState<Message[]>([]);
+++  const [thinking, setThinking] = useState(false);
+++  const [streaming, setStreaming] = useState(false);
+++  const [streamText, setStreamText] = useState("");
+++  const busy = thinking || streaming;
+++  const cancelled = useRef(false);
+++
+++  const ensureChat = useCallback(async (): Promise<string> => {
+++    if (chatId) return chatId;
+++    const { chat } = await api.createChat();
+++    setChatId(chat.id);
+++    return chat.id;
+++  }, [chatId]);
+++
+++  const send = useCallback(
+++    async (text: string, image?: string) => {
+++      const msg = text.trim();
+++      if ((!msg && !image) || busy) return;
+++      cancelled.current = false;
+++      // Only show a user bubble when text was actually sent. Image-only turns
+++      // rely on the backend's default prompt ("Describe this screenshot briefly.").
+++      if (msg) setMessages((m) => [...m, { role: "user", text: msg }]);
+++      setThinking(true);
+++      setStreamText("");
+++
+++      try {
+++        const id = await ensureChat();
+++        let acc = "";
+++        for await (const chunk of api.chat(id, msg, image)) {
+++          if (cancelled.current) break;
+++          acc += chunk;
+++          setThinking(false);
+++          setStreaming(true);
+++          setStreamText(acc);
+++        }
+++        if (cancelled.current) {
+++          // If we received partial text before a switch/reset, keep it so the
+++          // user isn't left with a dangling user bubble.
+++          if (acc) {
+++            setMessages((m) => [...m, { role: "assistant", text: `${acc}\n\n[cancelled]` }]);
+++          }
+++        } else {
+++          const answer = acc || "(no response)";
+++          setMessages((m) => [...m, { role: "assistant", text: answer }]);
+++          onDone?.();
+++        }
+++      } catch (e) {
+++        setMessages((m) => [
+++          ...m,
+++          { role: "assistant", text: `[error] ${(e as Error).message}` },
+++        ]);
+++      } finally {
+++        setThinking(false);
+++        setStreaming(false);
+++        setStreamText("");
+++      }
+++    },
+++    [busy, ensureChat, onDone],
+++  );
+++
+++  /** Load an existing chat (from History) into this panel. */
+++  const load = useCallback(async (id: string) => {
+++    cancelled.current = true;
+++    const detail = await api.getChat(id);
+++    setChatId(detail.id);
+++    setMessages(toUiMessages(detail.messages));
+++    setThinking(false);
+++    setStreaming(false);
+++    setStreamText("");
+++  }, []);
+++
+++  const reset = useCallback(() => {
+++    cancelled.current = true;
+++    setChatId(null);
+++    setMessages([]);
+++    setThinking(false);
+++    setStreaming(false);
+++    setStreamText("");
+++  }, []);
+++
+++  return { chatId, messages, thinking, streaming, streamText, busy, send, load, reset };
+++}
++diff --git a/apps/desktop/src/hooks/useSettings.ts b/apps/desktop/src/hooks/useSettings.ts
++new file mode 100644
++index 0000000..3699a4f
++--- /dev/null
+++++ b/apps/desktop/src/hooks/useSettings.ts
++@@ -0,0 +1,49 @@
+++import { useCallback, useEffect, useState } from "react";
+++import type { Provider, Settings } from "../types";
+++
+++const KEY = "glassview.settings";
+++const API_KEY = "glassview.apiKey";
+++
+++const DEFAULTS: Settings = {
+++  shortcut: "Ctrl+Shift+Space",
+++  closeOnBlur: true,
+++  autoLaunch: false,
+++  streaming: true,
+++  privacy: true,
+++  autoContext: true,
+++};
+++
+++/** Detect provider from an API-key prefix (brief's detectProvider). */
+++export function detectProvider(key: string): Provider {
+++  if (!key) return "ollama";
+++  if (key.startsWith("sk-ant-")) return "anthropic";
+++  if (key.startsWith("sk-")) return "openai";
+++  return "ollama";
+++}
+++
+++/** Settings + API key, persisted to localStorage and re-applied on load. */
+++export function useSettings() {
+++  const [settings, setSettings] = useState<Settings>(() => {
+++    try {
+++      const raw = localStorage.getItem(KEY);
+++      return raw ? { ...DEFAULTS, ...JSON.parse(raw) } : DEFAULTS;
+++    } catch {
+++      return DEFAULTS;
+++    }
+++  });
+++  const [apiKey, setApiKey] = useState<string>(() => localStorage.getItem(API_KEY) ?? "");
+++
+++  useEffect(() => {
+++    localStorage.setItem(KEY, JSON.stringify(settings));
+++  }, [settings]);
+++
+++  useEffect(() => {
+++    localStorage.setItem(API_KEY, apiKey);
+++  }, [apiKey]);
+++
+++  const update = useCallback(<K extends keyof Settings>(key: K, value: Settings[K]) => {
+++    setSettings((s) => ({ ...s, [key]: value }));
+++  }, []);
+++
+++  return { settings, setSettings, update, apiKey, setApiKey };
+++}
++diff --git a/apps/desktop/src/types.ts b/apps/desktop/src/types.ts
++new file mode 100644
++index 0000000..63441bc
++--- /dev/null
+++++ b/apps/desktop/src/types.ts
++@@ -0,0 +1,33 @@
+++// Shared types for the GlassView overlay.
+++
+++export type ThemeName = "dark" | "light";
+++
+++export type ToolId = "chat" | "region" | "voice" | "history" | "settings";
+++
+++export interface Tool {
+++  id: ToolId;
+++  label: string;
+++  kbd: string;
+++  icon: keyof typeof import("./components/icons").Icons;
+++}
+++
+++export interface Pos {
+++  x: number;
+++  y: number;
+++}
+++
+++export type Provider = "ollama" | "openai" | "anthropic";
+++
+++export interface Settings {
+++  shortcut: string;
+++  closeOnBlur: boolean;
+++  autoLaunch: boolean;
+++  streaming: boolean;
+++  privacy: boolean;
+++  autoContext: boolean;
+++}
+++
+++export interface Message {
+++  role: "user" | "assistant";
+++  text: string;
+++}
++diff --git a/docs/AI_SCREEN_ASSISTANT_REVIEW.md b/docs/AI_SCREEN_ASSISTANT_REVIEW.md
++new file mode 100644
++index 0000000..f0ea2ef
++--- /dev/null
+++++ b/docs/AI_SCREEN_ASSISTANT_REVIEW.md
++@@ -0,0 +1,109 @@
+++# GlassView AI / AI Screen Assistant — Review Progress & Bug Audit
+++
+++**Reviewed:** 2026-06-26
+++**Scope:** `glassview_ai/` backend + `apps/desktop/` Tauri/React frontend
+++**Status:** Read-through complete; tests/build passing; bugs catalogued below.
+++
+++## Verification run
+++
+++| Check | Command | Result |
+++|---|---|---|
+++| Backend tests | `.venv/Scripts/python.exe -m pytest` | **31 passed** |
+++| Frontend build | `cd apps/desktop && npm run build` | **built** (tsc + vite) |
+++| Kimi skill load | `kimi -p "list skills"` | **273 ECC skills** available |
+++
+++## Architecture summary
+++
+++- **Backend:** FastAPI on `127.0.0.1:8765` with SQLite per-chat history, Ollama streaming chat, RAG memory (`sqlite-vec`/HashEmbedder), OCR fusion (Tesseract optional), privacy redaction, and a small agent loop.
+++- **Frontend:** Tauri v2 + React 18 + Vite. Draggable pill → toolbar → glass panels (Chat, Voice, History, Settings). Region capture is done inside the main fullscreen window with a Rust global-Escape failsafe.
+++- **Native shell:** Transparent always-on-top window, system tray, global `Ctrl+Shift+Space` toggle, Python backend sidecar auto-spawn.
+++
+++## Bugs & issues found
+++
+++### 🔴 Functional bugs
+++
+++1. **Empty user message is still added when only an image is sent**
+++   - **File:** `apps/desktop/src/hooks/useChat.ts:37`
+++   - **Issue:** `setMessages((m) => [...m, { role: "user", text: msg }])` runs even if `msg` is empty and only `image` is provided. The UI then shows a blank user bubble.
+++   - **Fix:** Only push the user bubble if `msg` is non-empty; still send the image to the backend.
+++
+++2. **Backend persists partial response instead of the error when streaming fails**
+++   - **File:** `glassview_ai/main.py:165-182`
+++   - **Issue:** If an exception occurs mid-stream, the `[error] ...` chunk is yielded to the client, but in `finally` the assistant message is saved as `answer = "".join(answer_parts) or error or "(no response)"`. `answer_parts` only contains tokens before the exception, so the DB stores the partial response, not the error.
+++   - **Fix:** Append the error to `answer_parts` before persisting, or clear `answer_parts` and persist only the error.
+++
+++3. **Theme is stored twice, `settings.theme` is never used**
+++   - **Files:** `apps/desktop/src/hooks/useSettings.ts:8-15`, `apps/desktop/src/hooks/useTheme.ts`, `apps/desktop/src/components/panels/SettingsPanel.tsx:27-43`
+++   - **Issue:** `Settings` has a `theme` field, but theme state is managed separately by `useTheme` with its own `localStorage` key. `SettingsPanel` receives `theme`/`setTheme` from `useTheme`, so `settings.theme` is dead data and can drift.
+++   - **Fix:** Either remove `theme` from `Settings` and use `useTheme` everywhere, or have `useSettings` own theme and pass it down.
+++
+++4. **Global shortcut is never unregistered on settings change (possible duplicate registration)**
+++   - **Files:** `apps/desktop/src-tauri/src/main.rs:46-50`, `apps/desktop/src/App.tsx:91-93`
+++   - **Issue:** `register_shortcut` calls `unregister_all()` then registers the new accelerator, but if the new accelerator is invalid it fails silently and the frontend has no shortcut. Also, the default shortcut is registered at startup before the frontend loads; when the frontend later registers the same shortcut, it briefly unregister-all then re-register.
+++   - **Fix:** Return success/failure from `register_shortcut` so the UI can warn. Consider registering only from the frontend once settings are loaded.
+++
+++5. **Region selection can get stuck if mouse is released outside the window**
+++   - **File:** `apps/desktop/src/components/RegionSelect.tsx:23-44`
+++   - **Issue:** `onMouseUp` is bound to the overlay div. If the user drags outside the window and releases, `onMouseUp` never fires and the box stays in dragging state until mouse re-enters.
+++   - **Fix:** Add a `window`/`document` mouseup listener while dragging, or rely on the existing Esc failsafe.
+++
+++### 🟡 UX / reliability issues
+++
+++6. **Cancel mid-stream leaves the assistant bubble empty**
+++   - **File:** `apps/desktop/src/hooks/useChat.ts:44-45`
+++   - **Issue:** `cancelled.current` is checked inside the streaming loop; if true, the function returns early. The `finally` block clears `streamText` but never appends any assistant message, so the user sees their own message with no reply.
+++   - **Fix:** On cancellation, append an assistant message like "[cancelled]" or keep the partial streamed text as a message.
+++
+++7. **History panel never refreshes after opening a chat or creating a new one**
+++   - **File:** `apps/desktop/src/components/panels/HistoryPanel.tsx:26-34`
+++   - **Issue:** `useEffect` with empty deps loads chats once. After sending a message in a new chat, the chat gets a title in the DB but History still shows old data until reopened.
+++   - **Fix:** Refresh the list when the panel opens (e.g., re-run on mount and when `activeTool` becomes `"history"`).
+++
+++8. **Voice transcript is lost if recognition errors out**
+++   - **File:** `apps/desktop/src/components/panels/VoicePanel.tsx:57`
+++   - **Issue:** `rec.onerror` only sets `recording` to false; the user gets no feedback that speech recognition failed.
+++   - **Fix:** Surface an error state/message.
+++
+++9. **Chat input `autoFocus` steals focus when panel re-renders**
+++   - **File:** `apps/desktop/src/components/panels/ChatPanel.tsx:123`
+++   - **Issue:** The input has `autoFocus`, so any re-render of `ChatPanel` (e.g., streaming update) can pull focus back to the input.
+++   - **Fix:** Only autofocus when the panel first mounts, or remove `autoFocus` and focus via effect on open.
+++
+++10. **Settings toggles use `as never` cast**
+++    - **File:** `apps/desktop/src/components/panels/SettingsPanel.tsx:90,103`
+++    - **Issue:** Type-unsafe cast. Works but is a code-smell and can mask type errors as settings grow.
+++    - **Fix:** Make the toggle helper generic over `boolean` settings keys.
+++
+++### 🟢 Backend / code quality
+++
+++11. **`OLLAMA_HOST` is bound at module import despite comment claiming otherwise**
+++    - **File:** `glassview_ai/config.py:24`
+++    - **Issue:** Line 24 assigns `OLLAMA_HOST = os.environ.get(...)` at import time, contradicting the docstring. The variable is unused, so it's harmless but misleading.
+++    - **Fix:** Remove the module-level binding or update the comment.
+++
+++12. **`app.state.ollama` is created but never used**
+++    - **File:** `glassview_ai/main.py:42`
+++    - **Issue:** A client is stored in lifespan but each `/chat` request creates a fresh `OllamaClient` based on the routing decision.
+++    - **Fix:** Use `app.state.ollama` when `decision.model` equals the default model; only create a new client when routing picks a different model.
+++
+++13. **Agent loop JSON regex is greedy**
+++    - **File:** `glassview_ai/agents/loop.py:16`
+++    - **Issue:** `re.compile(r"\{.*\}", re.DOTALL)` matches from the first `{` to the last `}` in the output. If the model outputs explanatory text around JSON, or multiple JSON objects, parsing can fail or pick the wrong object.
+++    - **Fix:** Use a non-greedy match or a proper JSON-lines/JSON-block extractor.
+++
+++14. **CSP is disabled (`null`) in Tauri config**
+++    - **File:** `apps/desktop/src-tauri/tauri.conf.json:30`
+++    - **Issue:** `"csp": null` removes content-security-policy in the bundled app.
+++    - **Fix:** Set a restrictive CSP for production builds (e.g., `default-src 'self'`).
+++
+++15. **Window is user-resizable but app also auto-fits**
+++    - **File:** `apps/desktop/src-tauri/tauri.conf.json:24`, `apps/desktop/src/lib/tauri.ts:77-110`
+++    - **Issue:** `resizable: true` allows the user to resize, but `fitWindowToContent` will resize back on content changes. This can create a jarring fight.
+++    - **Fix:** Set `resizable: false` since the app is intended to be content-sized.
+++
+++## Files read
+++
+++- Backend: `main.py`, `config.py`, `db.py`, `ollama_client.py`, `schemas.py`, `routing/router.py`, `ocr/fuse.py`, `agents/loop.py`, `agents/registry.py`
+++- Frontend: `App.tsx`, `main.tsx`, `types.ts`, `styles/global.css`, `styles/tokens.ts`, `hooks/useChat.ts`, `hooks/useTheme.ts`, `hooks/useSettings.ts`, `hooks/useHealth.ts`, `hooks/useDrag.ts`, `api/client.ts`, `lib/tauri.ts`, `components/Pill.tsx`, `components/Toolbar.tsx`, `components/RegionSelect.tsx`, `components/Icon.tsx`, `components/icons.ts`, `components/tools.ts`, `components/panels/Panel.tsx`, `components/panels/ChatPanel.tsx`, `components/panels/HistoryPanel.tsx`, `components/panels/VoicePanel.tsx`, `components/panels/SettingsPanel.tsx`, `components/panels/ErrorPanel.tsx`
+++- Native: `src-tauri/src/main.rs`, `src-tauri/src/capture.rs`, `src-tauri/src/sidecar.rs`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`
+++- Docs: `README.md`, `docs/HANDOFF.md`
++diff --git a/glassview_ai/agents/loop.py b/glassview_ai/agents/loop.py
++new file mode 100644
++index 0000000..ab9cff8
++--- /dev/null
+++++ b/glassview_ai/agents/loop.py
++@@ -0,0 +1,126 @@
+++"""The agent loop itself: parse model output, run tools, bound the steps."""
+++
+++from __future__ import annotations
+++
+++import json
+++from collections.abc import Awaitable, Callable
+++from dataclasses import dataclass, field
+++from typing import Any
+++
+++from .registry import ToolRegistry
+++
+++# ``complete`` takes the running transcript and returns the next model message.
+++CompleteFn = Callable[[list[dict[str, str]]], Awaitable[str]]
+++
+++
+++@dataclass(frozen=True)
+++class AgentStep:
+++    tool: str
+++    args: dict[str, Any]
+++    observation: str
+++
+++
+++@dataclass(frozen=True)
+++class AgentResult:
+++    answer: str
+++    steps: list[AgentStep] = field(default_factory=list)
+++    stopped_reason: str = "final"
+++
+++
+++def _extract_json_block(output: str) -> str | None:
+++    """Return the first balanced JSON object literal found in ``output``."""
+++    start = output.find("{")
+++    if start == -1:
+++        return None
+++    depth = 0
+++    in_string = False
+++    escape = False
+++    for i, ch in enumerate(output[start:], start=start):
+++        if escape:
+++            escape = False
+++            continue
+++        if ch == "\\":
+++            escape = True
+++            continue
+++        if ch == '"':
+++            in_string = not in_string
+++            continue
+++        if in_string:
+++            continue
+++        if ch == "{":
+++            depth += 1
+++        elif ch == "}":
+++            depth -= 1
+++            if depth == 0:
+++                return output[start : i + 1]
+++    return None
+++
+++
+++def _parse(output: str) -> dict[str, Any] | None:
+++    """Pull the first JSON object out of a model message, if any."""
+++    block = _extract_json_block(output)
+++    if block is None:
+++        return None
+++    try:
+++        obj = json.loads(block)
+++    except json.JSONDecodeError:
+++        return None
+++    return obj if isinstance(obj, dict) else None
+++
+++
+++async def run_agent(
+++    question: str,
+++    complete: CompleteFn,
+++    registry: ToolRegistry,
+++    *,
+++    system_prompt: str = "",
+++    max_steps: int = 4,
+++) -> AgentResult:
+++    """Drive the tool-use loop.
+++
+++    The model should reply with either ``{"tool": "<name>", "args": {...}}`` to
+++    call a tool or ``{"final": "<answer>"}`` to finish. Free-text replies with
+++    no JSON are treated as the final answer, so a model that just answers still
+++    works.
+++    """
+++    catalogue = registry.describe()
+++    sys = (
+++        f"{system_prompt}\n\nYou may use tools. Available tools:\n{catalogue}\n\n"
+++        'To call a tool reply ONLY with {"tool": "name", "args": {...}}. '
+++        'When you can answer, reply with {"final": "your answer"}.'
+++    ).strip()
+++
+++    transcript: list[dict[str, str]] = [
+++        {"role": "system", "content": sys},
+++        {"role": "user", "content": question},
+++    ]
+++    steps: list[AgentStep] = []
+++
+++    for _ in range(max_steps):
+++        output = await complete(transcript)
+++        parsed = _parse(output)
+++
+++        if parsed is None or "final" in parsed:
+++            answer = parsed["final"] if parsed and "final" in parsed else output.strip()
+++            return AgentResult(answer=answer, steps=steps)
+++
+++        name = parsed.get("tool")
+++        args = parsed.get("args") or {}
+++        tool = registry.get(name) if isinstance(name, str) else None
+++        if tool is None:
+++            observation = f"error: unknown tool {name!r}"
+++        else:
+++            try:
+++                observation = str(await tool.call(**args))
+++            except Exception as exc:  # noqa: BLE001 - surface tool failure to the model
+++                observation = f"error: {exc}"
+++
+++        steps.append(AgentStep(tool=str(name), args=args, observation=observation))
+++        transcript.append({"role": "assistant", "content": output})
+++        transcript.append({"role": "user", "content": f"Observation: {observation}"})
+++
+++    return AgentResult(
+++        answer="(stopped: step budget reached)",
+++        steps=steps,
+++        stopped_reason="max_steps",
+++    )
++diff --git a/glassview_ai/config.py b/glassview_ai/config.py
++new file mode 100644
++index 0000000..3f1b6eb
++--- /dev/null
+++++ b/glassview_ai/config.py
++@@ -0,0 +1,107 @@
+++"""Runtime configuration + Ollama model auto-detection.
+++
+++The old prototype hardcoded ``qwen3-vl:8b-instruct`` which did not match the
+++installed tag (``qwen3-vl:8b``), so a fresh clone failed. Here we detect an
+++installed vision model at startup and fail loudly with a helpful message if none
+++is present, instead of silently 404ing mid-request.
+++"""
+++
+++from __future__ import annotations
+++
+++import os
+++from dataclasses import dataclass
+++
+++import httpx
+++
+++DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
+++DEFAULT_DB_PATH = os.path.join(
+++    os.path.dirname(os.path.dirname(__file__)), "glassview.db"
+++)
+++
+++# Env is read at call time (see load_settings / detect_model) so that tests and
+++# the launcher can set GLASSVIEW_DB / OLLAMA_HOST before values are resolved.
+++
+++# Preference order when several vision tags are installed. We prefer instruct
+++# tunes, then any qwen3-vl, then any model the user explicitly named.
+++_VISION_PREFERENCES = ("qwen3-vl",)
+++
+++MAX_HISTORY_TURNS = 12  # user/assistant pairs kept as rolling context
+++
+++SYSTEM_PROMPT = (
+++    "You are GlassView, a local screen assistant. Respond directly and clearly "
+++    "in Markdown. Use bullet points for lists and LaTeX for math (inline $...$ "
+++    "or block $$...$$). Do not include chain-of-thought or meta commentary; just "
+++    "answer the user."
+++)
+++
+++
+++@dataclass(frozen=True)
+++class Settings:
+++    ollama_host: str
+++    model: str
+++    db_path: str
+++
+++
+++class ModelNotFoundError(RuntimeError):
+++    """Raised when no usable vision model is installed in Ollama."""
+++
+++
+++def _list_installed_models(host: str) -> list[str]:
+++    try:
+++        resp = httpx.get(f"{host}/api/tags", timeout=5.0)
+++        resp.raise_for_status()
+++    except httpx.HTTPError as exc:  # daemon down or unreachable
+++        raise ModelNotFoundError(
+++            f"Cannot reach Ollama at {host}. Is the daemon running "
+++            f"('ollama serve')? Underlying error: {exc}"
+++        ) from exc
+++    data = resp.json()
+++    return [m.get("name", "") for m in data.get("models", []) if m.get("name")]
+++
+++
+++def detect_model(host: str | None = None, override: str | None = None) -> str:
+++    """Pick the model to use.
+++
+++    Order: explicit override (env ``OLLAMA_MODEL`` or arg) if installed, else a
+++    preferred vision family (instruct first), else raise with guidance.
+++    """
+++    host = host or os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
+++    override = override or os.environ.get("OLLAMA_MODEL")
+++    installed = _list_installed_models(host)
+++
+++    if override:
+++        if override in installed:
+++            return override
+++        # Allow a bare family name to match a concrete tag (qwen3-vl -> qwen3-vl:8b)
+++        match = next((m for m in installed if m.startswith(override)), None)
+++        if match:
+++            return match
+++        raise ModelNotFoundError(
+++            f"Requested model '{override}' is not installed. Installed: "
+++            f"{installed or '(none)'}. Pull it with 'ollama pull {override}'."
+++        )
+++
+++    for family in _VISION_PREFERENCES:
+++        # Prefer an instruct tune within the family if available.
+++        instruct = next(
+++            (m for m in installed if m.startswith(family) and "instruct" in m), None
+++        )
+++        if instruct:
+++            return instruct
+++        any_tag = next((m for m in installed if m.startswith(family)), None)
+++        if any_tag:
+++            return any_tag
+++
+++    raise ModelNotFoundError(
+++        "No vision model found. Pull one with 'ollama pull qwen3-vl:8b' "
+++        f"(installed models: {installed or '(none)'})."
+++    )
+++
+++
+++def load_settings() -> Settings:
+++    host = os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
+++    return Settings(
+++        ollama_host=host,
+++        model=detect_model(host),
+++        db_path=os.environ.get("GLASSVIEW_DB", DEFAULT_DB_PATH),
+++    )
++diff --git a/glassview_ai/main.py b/glassview_ai/main.py
++new file mode 100644
++index 0000000..0480ae3
++--- /dev/null
+++++ b/glassview_ai/main.py
++@@ -0,0 +1,214 @@
+++"""FastAPI app: streaming chat + SQLite history. No global session state.
+++
+++Each request carries a ``chat_id``; history is loaded from SQLite per-request,
+++so multiple windows / concurrent requests stay isolated (the prototype kept one
+++module-level conversation for the whole process).
+++"""
+++
+++from __future__ import annotations
+++
+++from collections.abc import AsyncIterator
+++from contextlib import asynccontextmanager
+++
+++from fastapi import FastAPI, HTTPException
+++from fastapi.middleware.cors import CORSMiddleware
+++from fastapi.responses import StreamingResponse
+++
+++from . import config
+++from .db import ChatStore
+++from .ocr import extract as ocr_extract
+++from .ocr import fuse_prompt
+++from .ollama_client import OllamaClient, build_messages
+++from .rag import HashEmbedder, MemoryStore
+++from .routing import RoutePolicy, route
+++from .schemas import (
+++    ChatRequest,
+++    ChatSummary,
+++    HealthResponse,
+++    NewChatRequest,
+++    RenameRequest,
+++)
+++
+++# Resolved at startup in the lifespan; kept on app.state for testability.
+++
+++
+++@asynccontextmanager
+++async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+++    settings = config.load_settings()
+++    store = ChatStore(settings.db_path)
+++    await store.connect()
+++    app.state.settings = settings
+++    app.state.store = store
+++    app.state.ollama = OllamaClient(settings.ollama_host, settings.model)
+++    # Routing has one installed model today, so fast and strong are the same tag;
+++    # the recorded reason still shows when an escalation would have happened.
+++    app.state.policy = RoutePolicy(fast=settings.model, strong=settings.model)
+++    # Memory lives beside the chat DB and uses the offline embedder by default
+++    # so recall works without a running embedding model.
+++    app.state.memory = MemoryStore(
+++        path=f"{settings.db_path}.memories.db", embedder=HashEmbedder()
+++    )
+++    try:
+++        yield
+++    finally:
+++        await store.close()
+++        app.state.memory.close()
+++
+++
+++app = FastAPI(title="GlassView AI", version="0.2.0", lifespan=lifespan)
+++app.add_middleware(
+++    CORSMiddleware,
+++    allow_origins=["*"],  # local-only desktop app; tightened behind Tauri in prod
+++    allow_methods=["*"],
+++    allow_headers=["*"],
+++)
+++
+++
+++def _store(app: FastAPI) -> ChatStore:
+++    return app.state.store
+++
+++
+++@app.get("/health", response_model=HealthResponse)
+++async def health() -> HealthResponse:
+++    s = app.state.settings
+++    return HealthResponse(status="ok", model=s.model, ollama_host=s.ollama_host)
+++
+++
+++# --- chat CRUD ---------------------------------------------------------------
+++@app.get("/chats")
+++async def list_chats() -> dict:
+++    return {"chats": [ChatSummary(**c).model_dump() for c in await _store(app).list_chats()]}
+++
+++
+++@app.post("/chats")
+++async def new_chat(req: NewChatRequest) -> dict:
+++    chat = await _store(app).create_chat(title=req.title)
+++    return {"chat": ChatSummary(**chat).model_dump()}
+++
+++
+++@app.get("/chats/{chat_id}")
+++async def get_chat(chat_id: str) -> dict:
+++    chat = await _store(app).get_chat(chat_id)
+++    if chat is None:
+++        raise HTTPException(status_code=404, detail="Chat not found")
+++    return chat
+++
+++
+++@app.patch("/chats/{chat_id}")
+++async def rename_chat(chat_id: str, req: RenameRequest) -> dict:
+++    title = req.title.strip()
+++    if not title:
+++        raise HTTPException(status_code=400, detail="Missing title")
+++    if not await _store(app).rename_chat(chat_id, title):
+++        raise HTTPException(status_code=404, detail="Chat not found")
+++    return {"ok": True}
+++
+++
+++@app.delete("/chats/{chat_id}")
+++async def delete_chat(chat_id: str) -> dict:
+++    if not await _store(app).delete_chat(chat_id):
+++        raise HTTPException(status_code=404, detail="Chat not found")
+++    return {"ok": True}
+++
+++
+++@app.post("/chats/{chat_id}/clear")
+++async def clear_chat(chat_id: str) -> dict:
+++    await _store(app).clear_messages(chat_id)
+++    return {"ok": True}
+++
+++
+++# --- streaming chat ----------------------------------------------------------
+++def _image_bytes(image: str) -> bytes | None:
+++    """Decode a data URL or bare base64 image to raw bytes, or None on failure."""
+++    import base64
+++
+++    try:
+++        b64 = image.split(",", 1)[1] if "," in image else image
+++        return base64.b64decode(b64)
+++    except Exception:  # noqa: BLE001 - a bad image just disables OCR for this turn
+++        return None
+++
+++
+++@app.post("/chat")
+++async def chat(req: ChatRequest) -> StreamingResponse:
+++    store = _store(app)
+++    memory: MemoryStore = app.state.memory
+++
+++    await store.create_chat(chat_id=req.chat_id)  # idempotent
+++    history = (await store.get_messages(req.chat_id))[-config.MAX_HISTORY_TURNS * 2:]
+++
+++    # A new image resets the visual context for this chat; otherwise reuse last.
+++    image = req.image or await store.last_image(req.chat_id)
+++
+++    # OCR fusion: fold any on-screen text into the prompt (no-op without Tesseract
+++    # or without an image). The stored user message stays the original question.
+++    prompt = req.message
+++    if image:
+++        raw = _image_bytes(image)
+++        if raw is not None:
+++            ocr = ocr_extract(raw)
+++            prompt = fuse_prompt(req.message, ocr.text)
+++
+++    # Route to a model tier based on the prompt and whether an image is present.
+++    decision = route(req.message, has_image=bool(image), policy=app.state.policy)
+++    # Reuse the lifespan client when routing lands on the default model;
+++    # only spin up a different client if routing ever picks another tag.
+++    ollama = (
+++        app.state.ollama
+++        if decision.model == app.state.settings.model
+++        else OllamaClient(app.state.settings.ollama_host, decision.model)
+++    )
+++
+++    messages = build_messages(config.SYSTEM_PROMPT, history, prompt, image)
+++
+++    async def event_stream() -> AsyncIterator[bytes]:
+++        answer_parts: list[str] = []
+++        error: str | None = None
+++        try:
+++            async for chunk in ollama.stream_chat(messages):
+++                answer_parts.append(chunk)
+++                yield chunk.encode("utf-8")
+++        except Exception as exc:  # noqa: BLE001
+++            # The 200 header is already sent, so a raised error would otherwise
+++            # reach the client as a silent empty body. Surface it in the stream
+++            # instead, and record it so the failed turn is not lost.
+++            error = f"[error] {exc}"
+++            yield error.encode("utf-8")
+++        finally:
+++            # If an error occurred mid-stream, record the error rather than the
+++            # partial tokens so the chat history matches what the user saw.
+++            answer = error if error is not None else ("".join(answer_parts) or "(no response)")
+++            # Persist the turn (store the image only on the message that introduced it).
+++            await store.add_message(
+++                req.chat_id, "user", req.message or "",
+++                images=[req.image] if req.image else [],
+++            )
+++            await store.add_message(req.chat_id, "assistant", answer)
+++            # Remember successful turns for later recall; redaction happens inside
+++            # the store. Failed turns are not worth recalling.
+++            if error is None and answer_parts:
+++                memory.add(
+++                    f"Q: {req.message}\nA: {answer}",
+++                    meta={"chat_id": req.chat_id, "model": decision.model},
+++                )
+++
+++    return StreamingResponse(
+++        event_stream(),
+++        media_type="text/plain; charset=utf-8",
+++        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+++    )
+++
+++
+++# --- memory recall -----------------------------------------------------------
+++@app.get("/recall")
+++async def recall(q: str, k: int = 5) -> dict:
+++    """Semantic search over remembered turns ("what was that error yesterday")."""
+++    memory: MemoryStore = app.state.memory
+++    hits = memory.query(q, k=k)
+++    return {
+++        "hits": [
+++            {"text": h.text, "distance": h.distance, "meta": h.meta,
+++             "created_at": h.created_at}
+++            for h in hits
+++        ]
+++    }
++-- 
++2.52.0.windows.1
++
+diff --git a/glassview_ai/agents/loop.py b/glassview_ai/agents/loop.py
+new file mode 100644
+index 0000000..ab9cff8
+--- /dev/null
++++ b/glassview_ai/agents/loop.py
+@@ -0,0 +1,126 @@
++"""The agent loop itself: parse model output, run tools, bound the steps."""
++
++from __future__ import annotations
++
++import json
++from collections.abc import Awaitable, Callable
++from dataclasses import dataclass, field
++from typing import Any
++
++from .registry import ToolRegistry
++
++# ``complete`` takes the running transcript and returns the next model message.
++CompleteFn = Callable[[list[dict[str, str]]], Awaitable[str]]
++
++
++@dataclass(frozen=True)
++class AgentStep:
++    tool: str
++    args: dict[str, Any]
++    observation: str
++
++
++@dataclass(frozen=True)
++class AgentResult:
++    answer: str
++    steps: list[AgentStep] = field(default_factory=list)
++    stopped_reason: str = "final"
++
++
++def _extract_json_block(output: str) -> str | None:
++    """Return the first balanced JSON object literal found in ``output``."""
++    start = output.find("{")
++    if start == -1:
++        return None
++    depth = 0
++    in_string = False
++    escape = False
++    for i, ch in enumerate(output[start:], start=start):
++        if escape:
++            escape = False
++            continue
++        if ch == "\\":
++            escape = True
++            continue
++        if ch == '"':
++            in_string = not in_string
++            continue
++        if in_string:
++            continue
++        if ch == "{":
++            depth += 1
++        elif ch == "}":
++            depth -= 1
++            if depth == 0:
++                return output[start : i + 1]
++    return None
++
++
++def _parse(output: str) -> dict[str, Any] | None:
++    """Pull the first JSON object out of a model message, if any."""
++    block = _extract_json_block(output)
++    if block is None:
++        return None
++    try:
++        obj = json.loads(block)
++    except json.JSONDecodeError:
++        return None
++    return obj if isinstance(obj, dict) else None
++
++
++async def run_agent(
++    question: str,
++    complete: CompleteFn,
++    registry: ToolRegistry,
++    *,
++    system_prompt: str = "",
++    max_steps: int = 4,
++) -> AgentResult:
++    """Drive the tool-use loop.
++
++    The model should reply with either ``{"tool": "<name>", "args": {...}}`` to
++    call a tool or ``{"final": "<answer>"}`` to finish. Free-text replies with
++    no JSON are treated as the final answer, so a model that just answers still
++    works.
++    """
++    catalogue = registry.describe()
++    sys = (
++        f"{system_prompt}\n\nYou may use tools. Available tools:\n{catalogue}\n\n"
++        'To call a tool reply ONLY with {"tool": "name", "args": {...}}. '
++        'When you can answer, reply with {"final": "your answer"}.'
++    ).strip()
++
++    transcript: list[dict[str, str]] = [
++        {"role": "system", "content": sys},
++        {"role": "user", "content": question},
++    ]
++    steps: list[AgentStep] = []
++
++    for _ in range(max_steps):
++        output = await complete(transcript)
++        parsed = _parse(output)
++
++        if parsed is None or "final" in parsed:
++            answer = parsed["final"] if parsed and "final" in parsed else output.strip()
++            return AgentResult(answer=answer, steps=steps)
++
++        name = parsed.get("tool")
++        args = parsed.get("args") or {}
++        tool = registry.get(name) if isinstance(name, str) else None
++        if tool is None:
++            observation = f"error: unknown tool {name!r}"
++        else:
++            try:
++                observation = str(await tool.call(**args))
++            except Exception as exc:  # noqa: BLE001 - surface tool failure to the model
++                observation = f"error: {exc}"
++
++        steps.append(AgentStep(tool=str(name), args=args, observation=observation))
++        transcript.append({"role": "assistant", "content": output})
++        transcript.append({"role": "user", "content": f"Observation: {observation}"})
++
++    return AgentResult(
++        answer="(stopped: step budget reached)",
++        steps=steps,
++        stopped_reason="max_steps",
++    )
+diff --git a/glassview_ai/config.py b/glassview_ai/config.py
+new file mode 100644
+index 0000000..3f1b6eb
+--- /dev/null
++++ b/glassview_ai/config.py
+@@ -0,0 +1,107 @@
++"""Runtime configuration + Ollama model auto-detection.
++
++The old prototype hardcoded ``qwen3-vl:8b-instruct`` which did not match the
++installed tag (``qwen3-vl:8b``), so a fresh clone failed. Here we detect an
++installed vision model at startup and fail loudly with a helpful message if none
++is present, instead of silently 404ing mid-request.
++"""
++
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass
++
++import httpx
++
++DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
++DEFAULT_DB_PATH = os.path.join(
++    os.path.dirname(os.path.dirname(__file__)), "glassview.db"
++)
++
++# Env is read at call time (see load_settings / detect_model) so that tests and
++# the launcher can set GLASSVIEW_DB / OLLAMA_HOST before values are resolved.
++
++# Preference order when several vision tags are installed. We prefer instruct
++# tunes, then any qwen3-vl, then any model the user explicitly named.
++_VISION_PREFERENCES = ("qwen3-vl",)
++
++MAX_HISTORY_TURNS = 12  # user/assistant pairs kept as rolling context
++
++SYSTEM_PROMPT = (
++    "You are GlassView, a local screen assistant. Respond directly and clearly "
++    "in Markdown. Use bullet points for lists and LaTeX for math (inline $...$ "
++    "or block $$...$$). Do not include chain-of-thought or meta commentary; just "
++    "answer the user."
++)
++
++
++@dataclass(frozen=True)
++class Settings:
++    ollama_host: str
++    model: str
++    db_path: str
++
++
++class ModelNotFoundError(RuntimeError):
++    """Raised when no usable vision model is installed in Ollama."""
++
++
++def _list_installed_models(host: str) -> list[str]:
++    try:
++        resp = httpx.get(f"{host}/api/tags", timeout=5.0)
++        resp.raise_for_status()
++    except httpx.HTTPError as exc:  # daemon down or unreachable
++        raise ModelNotFoundError(
++            f"Cannot reach Ollama at {host}. Is the daemon running "
++            f"('ollama serve')? Underlying error: {exc}"
++        ) from exc
++    data = resp.json()
++    return [m.get("name", "") for m in data.get("models", []) if m.get("name")]
++
++
++def detect_model(host: str | None = None, override: str | None = None) -> str:
++    """Pick the model to use.
++
++    Order: explicit override (env ``OLLAMA_MODEL`` or arg) if installed, else a
++    preferred vision family (instruct first), else raise with guidance.
++    """
++    host = host or os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
++    override = override or os.environ.get("OLLAMA_MODEL")
++    installed = _list_installed_models(host)
++
++    if override:
++        if override in installed:
++            return override
++        # Allow a bare family name to match a concrete tag (qwen3-vl -> qwen3-vl:8b)
++        match = next((m for m in installed if m.startswith(override)), None)
++        if match:
++            return match
++        raise ModelNotFoundError(
++            f"Requested model '{override}' is not installed. Installed: "
++            f"{installed or '(none)'}. Pull it with 'ollama pull {override}'."
++        )
++
++    for family in _VISION_PREFERENCES:
++        # Prefer an instruct tune within the family if available.
++        instruct = next(
++            (m for m in installed if m.startswith(family) and "instruct" in m), None
++        )
++        if instruct:
++            return instruct
++        any_tag = next((m for m in installed if m.startswith(family)), None)
++        if any_tag:
++            return any_tag
++
++    raise ModelNotFoundError(
++        "No vision model found. Pull one with 'ollama pull qwen3-vl:8b' "
++        f"(installed models: {installed or '(none)'})."
++    )
++
++
++def load_settings() -> Settings:
++    host = os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
++    return Settings(
++        ollama_host=host,
++        model=detect_model(host),
++        db_path=os.environ.get("GLASSVIEW_DB", DEFAULT_DB_PATH),
++    )
+diff --git a/glassview_ai/main.py b/glassview_ai/main.py
+new file mode 100644
+index 0000000..0480ae3
+--- /dev/null
++++ b/glassview_ai/main.py
+@@ -0,0 +1,214 @@
++"""FastAPI app: streaming chat + SQLite history. No global session state.
++
++Each request carries a ``chat_id``; history is loaded from SQLite per-request,
++so multiple windows / concurrent requests stay isolated (the prototype kept one
++module-level conversation for the whole process).
++"""
++
++from __future__ import annotations
++
++from collections.abc import AsyncIterator
++from contextlib import asynccontextmanager
++
++from fastapi import FastAPI, HTTPException
++from fastapi.middleware.cors import CORSMiddleware
++from fastapi.responses import StreamingResponse
++
++from . import config
++from .db import ChatStore
++from .ocr import extract as ocr_extract
++from .ocr import fuse_prompt
++from .ollama_client import OllamaClient, build_messages
++from .rag import HashEmbedder, MemoryStore
++from .routing import RoutePolicy, route
++from .schemas import (
++    ChatRequest,
++    ChatSummary,
++    HealthResponse,
++    NewChatRequest,
++    RenameRequest,
++)
++
++# Resolved at startup in the lifespan; kept on app.state for testability.
++
++
++@asynccontextmanager
++async def lifespan(app: FastAPI) -> AsyncIterator[None]:
++    settings = config.load_settings()
++    store = ChatStore(settings.db_path)
++    await store.connect()
++    app.state.settings = settings
++    app.state.store = store
++    app.state.ollama = OllamaClient(settings.ollama_host, settings.model)
++    # Routing has one installed model today, so fast and strong are the same tag;
++    # the recorded reason still shows when an escalation would have happened.
++    app.state.policy = RoutePolicy(fast=settings.model, strong=settings.model)
++    # Memory lives beside the chat DB and uses the offline embedder by default
++    # so recall works without a running embedding model.
++    app.state.memory = MemoryStore(
++        path=f"{settings.db_path}.memories.db", embedder=HashEmbedder()
++    )
++    try:
++        yield
++    finally:
++        await store.close()
++        app.state.memory.close()
++
++
++app = FastAPI(title="GlassView AI", version="0.2.0", lifespan=lifespan)
++app.add_middleware(
++    CORSMiddleware,
++    allow_origins=["*"],  # local-only desktop app; tightened behind Tauri in prod
++    allow_methods=["*"],
++    allow_headers=["*"],
++)
++
++
++def _store(app: FastAPI) -> ChatStore:
++    return app.state.store
++
++
++@app.get("/health", response_model=HealthResponse)
++async def health() -> HealthResponse:
++    s = app.state.settings
++    return HealthResponse(status="ok", model=s.model, ollama_host=s.ollama_host)
++
++
++# --- chat CRUD ---------------------------------------------------------------
++@app.get("/chats")
++async def list_chats() -> dict:
++    return {"chats": [ChatSummary(**c).model_dump() for c in await _store(app).list_chats()]}
++
++
++@app.post("/chats")
++async def new_chat(req: NewChatRequest) -> dict:
++    chat = await _store(app).create_chat(title=req.title)
++    return {"chat": ChatSummary(**chat).model_dump()}
++
++
++@app.get("/chats/{chat_id}")
++async def get_chat(chat_id: str) -> dict:
++    chat = await _store(app).get_chat(chat_id)
++    if chat is None:
++        raise HTTPException(status_code=404, detail="Chat not found")
++    return chat
++
++
++@app.patch("/chats/{chat_id}")
++async def rename_chat(chat_id: str, req: RenameRequest) -> dict:
++    title = req.title.strip()
++    if not title:
++        raise HTTPException(status_code=400, detail="Missing title")
++    if not await _store(app).rename_chat(chat_id, title):
++        raise HTTPException(status_code=404, detail="Chat not found")
++    return {"ok": True}
++
++
++@app.delete("/chats/{chat_id}")
++async def delete_chat(chat_id: str) -> dict:
++    if not await _store(app).delete_chat(chat_id):
++        raise HTTPException(status_code=404, detail="Chat not found")
++    return {"ok": True}
++
++
++@app.post("/chats/{chat_id}/clear")
++async def clear_chat(chat_id: str) -> dict:
++    await _store(app).clear_messages(chat_id)
++    return {"ok": True}
++
++
++# --- streaming chat ----------------------------------------------------------
++def _image_bytes(image: str) -> bytes | None:
++    """Decode a data URL or bare base64 image to raw bytes, or None on failure."""
++    import base64
++
++    try:
++        b64 = image.split(",", 1)[1] if "," in image else image
++        return base64.b64decode(b64)
++    except Exception:  # noqa: BLE001 - a bad image just disables OCR for this turn
++        return None
++
++
++@app.post("/chat")
++async def chat(req: ChatRequest) -> StreamingResponse:
++    store = _store(app)
++    memory: MemoryStore = app.state.memory
++
++    await store.create_chat(chat_id=req.chat_id)  # idempotent
++    history = (await store.get_messages(req.chat_id))[-config.MAX_HISTORY_TURNS * 2:]
++
++    # A new image resets the visual context for this chat; otherwise reuse last.
++    image = req.image or await store.last_image(req.chat_id)
++
++    # OCR fusion: fold any on-screen text into the prompt (no-op without Tesseract
++    # or without an image). The stored user message stays the original question.
++    prompt = req.message
++    if image:
++        raw = _image_bytes(image)
++        if raw is not None:
++            ocr = ocr_extract(raw)
++            prompt = fuse_prompt(req.message, ocr.text)
++
++    # Route to a model tier based on the prompt and whether an image is present.
++    decision = route(req.message, has_image=bool(image), policy=app.state.policy)
++    # Reuse the lifespan client when routing lands on the default model;
++    # only spin up a different client if routing ever picks another tag.
++    ollama = (
++        app.state.ollama
++        if decision.model == app.state.settings.model
++        else OllamaClient(app.state.settings.ollama_host, decision.model)
++    )
++
++    messages = build_messages(config.SYSTEM_PROMPT, history, prompt, image)
++
++    async def event_stream() -> AsyncIterator[bytes]:
++        answer_parts: list[str] = []
++        error: str | None = None
++        try:
++            async for chunk in ollama.stream_chat(messages):
++                answer_parts.append(chunk)
++                yield chunk.encode("utf-8")
++        except Exception as exc:  # noqa: BLE001
++            # The 200 header is already sent, so a raised error would otherwise
++            # reach the client as a silent empty body. Surface it in the stream
++            # instead, and record it so the failed turn is not lost.
++            error = f"[error] {exc}"
++            yield error.encode("utf-8")
++        finally:
++            # If an error occurred mid-stream, record the error rather than the
++            # partial tokens so the chat history matches what the user saw.
++            answer = error if error is not None else ("".join(answer_parts) or "(no response)")
++            # Persist the turn (store the image only on the message that introduced it).
++            await store.add_message(
++                req.chat_id, "user", req.message or "",
++                images=[req.image] if req.image else [],
++            )
++            await store.add_message(req.chat_id, "assistant", answer)
++            # Remember successful turns for later recall; redaction happens inside
++            # the store. Failed turns are not worth recalling.
++            if error is None and answer_parts:
++                memory.add(
++                    f"Q: {req.message}\nA: {answer}",
++                    meta={"chat_id": req.chat_id, "model": decision.model},
++                )
++
++    return StreamingResponse(
++        event_stream(),
++        media_type="text/plain; charset=utf-8",
++        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
++    )
++
++
++# --- memory recall -----------------------------------------------------------
++@app.get("/recall")
++async def recall(q: str, k: int = 5) -> dict:
++    """Semantic search over remembered turns ("what was that error yesterday")."""
++    memory: MemoryStore = app.state.memory
++    hits = memory.query(q, k=k)
++    return {
++        "hits": [
++            {"text": h.text, "distance": h.distance, "meta": h.meta,
++             "created_at": h.created_at}
++            for h in hits
++        ]
++    }
+-- 
+2.52.0.windows.1
+
