@@ -37,6 +37,17 @@ interface LivePanel {
   closing: boolean;
 }
 
+/** True when a key press is text entry, so single-letter tool hotkeys must not fire. */
+function isTypingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return (
+    target.tagName === "INPUT" ||
+    target.tagName === "TEXTAREA" ||
+    target.tagName === "SELECT" ||
+    target.isContentEditable
+  );
+}
+
 /** Fallback origin (panel's own bottom-right) if the button can't be measured. */
 const FALLBACK_ORIGIN: PanelOrigin = { x: 320, dy: 30 };
 
@@ -290,8 +301,11 @@ export default function App() {
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (!expanded) return;
-      if (e.target instanceof HTMLElement && e.target.tagName === "INPUT") return;
+      // Escape closes the panel even from the chat field, which now keeps focus.
       if (e.key === "Escape") return setActiveTool(null);
+      if (isTypingTarget(e.target)) return;
+      // Ctrl+C (copy), Alt+S, etc. belong to the OS/webview, not the tool hotkeys.
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
       const tool = TOOLS.find((t) => t.kbd === e.key.toUpperCase());
       if (tool) {
         e.preventDefault();

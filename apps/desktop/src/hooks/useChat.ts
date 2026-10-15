@@ -43,7 +43,23 @@ export function useChat(options: UseChatOptions = {}) {
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState("");
   const busy = thinking || streaming;
-  const cancelled = useRef(false);
+  // Each turn gets a generation number and its own AbortController. Switching or
+  // resetting the chat bumps the generation and aborts the request, so a stale
+  // turn can never write its answer into whichever chat is loaded now.
+  const generation = useRef(0);
+  const inFlight = useRef<AbortController | null>(null);
+
+  // The aborted turn skips its own cleanup (it is no longer current), so the
+  // busy flags are cleared here; otherwise a failed load would leave the input
+  // stuck in the busy state.
+  const cancelInFlight = useCallback(() => {
+    generation.current += 1;
+    inFlight.current?.abort();
+    inFlight.current = null;
+    setThinking(false);
+    setStreaming(false);
+    setStreamText("");
+  }, []);
 
   const ensureChat = useCallback(async (): Promise<string> => {
     if (chatId) return chatId;
@@ -55,25 +71,30 @@ export function useChat(options: UseChatOptions = {}) {
   const send = useCallback(
     async (text: string, image?: string) => {
       const msg = text.trim();
-      if ((!msg && !image) || busy) return;
-      cancelled.current = false;
-      // Show a user bubble when there is anything to show — text, an attachment,
+      // inFlight is checked too: `busy` is render state, so two sends in the same
+      // tick would both see it as false.
+      if ((!msg && !image) || busy || inFlight.current) return;
+      const gen = ++generation.current;
+      const ctrl = new AbortController();
+      inFlight.current = ctrl;
+      const isCurrent = () => gen === generation.current;
+
+      // Show a user bubble when there is anything to show: text, an attachment,
       // or both. An image-only turn still gets a bubble (with the thumbnail); the
       // backend supplies the default prompt ("Describe this screenshot briefly.").
-      if (msg || image) {
-        setMessages((m) => [
-          ...m,
-          { role: "user", text: msg, images: image ? [image] : undefined },
-        ]);
-      }
+      setMessages((m) => [
+        ...m,
+        { role: "user", text: msg, images: image ? [image] : undefined },
+      ]);
       setThinking(true);
       setStreamText("");
 
       try {
         const id = await ensureChat();
         let acc = "";
-        for await (const chunk of api.chat(id, msg, image, { redact, provider, apiKey })) {
-          if (cancelled.current) break;
+        const opts = { redact, provider, apiKey, signal: ctrl.signal };
+        for await (const chunk of api.chat(id, msg, image, opts)) {
+          if (!isCurrent()) return;
           acc += chunk;
           // With streaming off, hold the thinking indicator and reveal the whole
           // answer once the turn completes.
@@ -83,26 +104,24 @@ export function useChat(options: UseChatOptions = {}) {
             setStreamText(acc);
           }
         }
-        if (cancelled.current) {
-          // If we received partial text before a switch/reset, keep it so the
-          // user isn't left with a dangling user bubble.
-          if (acc) {
-            setMessages((m) => [...m, { role: "assistant", text: `${acc}\n\n[cancelled]` }]);
-          }
-        } else {
-          const answer = acc || "(no response)";
-          setMessages((m) => [...m, { role: "assistant", text: answer }]);
-          onDoneRef.current?.();
-        }
+        if (!isCurrent()) return;
+        setMessages((m) => [...m, { role: "assistant", text: acc || "(no response)" }]);
+        onDoneRef.current?.();
       } catch (e) {
+        // An abort is a deliberate cancel, not an error to show the user.
+        if (!isCurrent() || ctrl.signal.aborted) return;
         setMessages((m) => [
           ...m,
           { role: "assistant", text: `[error] ${(e as Error).message}` },
         ]);
       } finally {
-        setThinking(false);
-        setStreaming(false);
-        setStreamText("");
+        // A newer turn or a chat switch owns these flags now; leave them alone.
+        if (isCurrent()) {
+          inFlight.current = null;
+          setThinking(false);
+          setStreaming(false);
+          setStreamText("");
+        }
       }
     },
     [apiKey, busy, ensureChat, provider, redact, showTokens],
@@ -110,23 +129,20 @@ export function useChat(options: UseChatOptions = {}) {
 
   /** Load an existing chat (from History) into this panel. */
   const load = useCallback(async (id: string) => {
-    cancelled.current = true;
+    cancelInFlight();
+    const gen = generation.current;
     const detail = await api.getChat(id);
+    // A second load or a reset may have happened while this one was fetching.
+    if (gen !== generation.current) return;
     setChatId(detail.id);
     setMessages(toUiMessages(detail.messages));
-    setThinking(false);
-    setStreaming(false);
-    setStreamText("");
-  }, []);
+  }, [cancelInFlight]);
 
   const reset = useCallback(() => {
-    cancelled.current = true;
+    cancelInFlight();
     setChatId(null);
     setMessages([]);
-    setThinking(false);
-    setStreaming(false);
-    setStreamText("");
-  }, []);
+  }, [cancelInFlight]);
 
   return { chatId, messages, thinking, streaming, streamText, busy, send, load, reset };
 }

@@ -149,7 +149,10 @@ export function ChatPanel({ messages, thinking, streaming, streamText, busy, onS
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
-          disabled={busy}
+          // Stays enabled while a reply streams: disabling it drops focus to the
+          // page, where typed letters would fire the C/R/H/S tool shortcuts.
+          // send() already ignores Enter while busy, so the next question can be
+          // typed early.
         />
         <button className="gv-send" onClick={send} disabled={(!input.trim() && !attached) || busy}>
           <Icon d={Icons.send} size={13} stroke="var(--gv-accentText)" sw={1.8} />
