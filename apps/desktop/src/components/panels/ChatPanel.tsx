@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "../Icon";
 import { Icons } from "../icons";
+import { Markdown } from "../Markdown";
 import type { Message } from "../../types";
 
 interface ChatPanelProps {
@@ -26,6 +27,7 @@ export function ChatPanel({ messages, thinking, streaming, streamText, busy, onS
   const [input, setInput] = useState("");
   const [attached, setAttached] = useState<{ name: string; dataUrl: string } | null>(null);
   const [dropOver, setDropOver] = useState(false);
+  const [attachError, setAttachError] = useState<string | null>(null);
   const msgsRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -42,6 +44,13 @@ export function ChatPanel({ messages, thinking, streaming, streamText, busy, onS
 
   const attach = async (file: File | undefined) => {
     if (!file) return;
+    // The backend sends attachments to a vision model as images. A non-image file
+    // would be encoded as one and silently produce nonsense, so reject it here.
+    if (!file.type.startsWith("image/")) {
+      setAttachError(`${file.name} isn't an image`);
+      return;
+    }
+    setAttachError(null);
     setAttached({ name: file.name, dataUrl: await readAsDataUrl(file) });
   };
 
@@ -77,18 +86,21 @@ export function ChatPanel({ messages, thinking, streaming, streamText, busy, onS
         onDrop={(e) => { e.preventDefault(); setDropOver(false); attach(e.dataTransfer.files?.[0]); }}
         onClick={() => fileRef.current?.click()}
       >
-        <Icon d={Icons.attach} size={13} stroke={attached ? "#3BAAFF" : "var(--gv-textFaint)"} sw={1.4} />
+        <Icon d={Icons.attach} size={13} stroke={attached ? "var(--gv-textPrimary)" : "var(--gv-textFaint)"} sw={1.4} />
         {attached ? (
           <div className="gv-file-chip">
             {attached.name}
             <button className="gv-file-rm" onClick={(e) => { e.stopPropagation(); setAttached(null); }}>✕</button>
           </div>
+        ) : attachError ? (
+          <span className="gv-drop-label gv-drop-error">{attachError}</span>
         ) : (
-          <span className="gv-drop-label">Drop a file or <span>click to attach</span></span>
+          <span className="gv-drop-label">Drop an image or <span>click to attach</span></span>
         )}
         <input
           ref={fileRef}
           type="file"
+          accept="image/*"
           hidden
           onChange={(e) => attach(e.target.files?.[0] ?? undefined)}
         />
@@ -98,7 +110,17 @@ export function ChatPanel({ messages, thinking, streaming, streamText, busy, onS
         <div className="gv-msgs" ref={msgsRef}>
           {messages.map((m, i) => (
             <div key={i} className={`gv-msg gv-msg-${m.role === "user" ? "u" : "a"}`}>
-              <div className={`gv-bubble gv-bubble-${m.role === "user" ? "u" : "a"}`}>{m.text}</div>
+              <div className={`gv-bubble gv-bubble-${m.role === "user" ? "u" : "a"}`}>
+                {m.images?.map((src, j) => (
+                  <img
+                    key={j}
+                    className="gv-attach-img"
+                    src={src.startsWith("data:") ? src : `data:image/png;base64,${src}`}
+                    alt="attachment"
+                  />
+                ))}
+                {m.role === "user" ? m.text : <Markdown text={m.text} />}
+              </div>
             </div>
           ))}
           {thinking && (
@@ -110,7 +132,7 @@ export function ChatPanel({ messages, thinking, streaming, streamText, busy, onS
           )}
           {streaming && streamText && (
             <div className="gv-msg gv-msg-a">
-              <div className="gv-bubble gv-bubble-a">{streamText}<span className="gv-cursor" /></div>
+              <div className="gv-bubble gv-bubble-a"><Markdown text={streamText} /><span className="gv-cursor" /></div>
             </div>
           )}
         </div>
@@ -130,7 +152,7 @@ export function ChatPanel({ messages, thinking, streaming, streamText, busy, onS
           disabled={busy}
         />
         <button className="gv-send" onClick={send} disabled={(!input.trim() && !attached) || busy}>
-          <Icon d={Icons.send} size={13} stroke="white" sw={1.8} />
+          <Icon d={Icons.send} size={13} stroke="var(--gv-accentText)" sw={1.8} />
         </button>
       </div>
     </>

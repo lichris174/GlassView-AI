@@ -1,14 +1,48 @@
-/* Base + pill/toolbar styles, ported from the mockup's makeCSS() factory but driven by
-   the --gv-* custom properties that tokens.ts/useTheme set on :root. Panel, chat, voice,
-   history, settings and region styles are added in later milestones. */
+/* Base + pill/toolbar styles, driven by the --gv-* custom properties that tokens.ts /
+   useTheme set on :root. Palette is "Monochrome Minimal"; type is Inter (UI) + JetBrains
+   Mono (metadata: keyboard hints, timestamps, badges, section labels), both vendored
+   locally so the offline Tauri shell needs no network. */
+
+/* Vendored variable fonts (latin subset). font-display:swap avoids invisible text. */
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('../assets/fonts/inter.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 100 800;
+  font-display: swap;
+  src: url('../assets/fonts/jetbrains-mono.woff2') format('woff2');
+}
+
+:root {
+  --gv-font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --gv-font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', 'Cascadia Code', monospace;
+
+  /* One shared motion rhythm so every component animates with the same feel. */
+  --gv-spring: cubic-bezier(.34, 1.4, .64, 1);
+  --gv-ease-out: cubic-bezier(.22, .61, .36, 1);
+  --gv-dur-fast: .15s;
+  --gv-dur: .24s;
+  --gv-dur-slow: .32s;
+
+  /* Subtle film grain reused across glass surfaces (breaks up flat fills). */
+  --gv-grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 html, body, #root { height: 100%; }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'SF Pro Text',
-    'Helvetica Neue', sans-serif;
+  font-family: var(--gv-font);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: 'cv05' 1, 'ss01' 1; /* Inter: open digits + single-storey a */
   overflow: hidden;
   user-select: none;
   -webkit-user-select: none;
@@ -37,7 +71,12 @@ body[data-stage="dev"] {
 
 .gv-pill {
   --pill-collapsed: 42px;   /* logo (40px) + 1px border each side */
-  --pill-expanded:  226px;  /* collapsed + sep + 5 tools (36px each) + padding */
+  /* Derived from the tool count (Pill.tsx sets --tool-count) so adding or
+     removing a tool can't leave the pill the wrong width. Per tool: 36px button
+     + 2px flex gap. Fixed part: 6px .gv-tools padding-left + 5px separator
+     (1px rule + 2px margin each side). */
+  --tool-count: 4;
+  --pill-expanded: calc(var(--pill-collapsed) + 11px + (var(--tool-count) * 38px));
 
   position: relative;
   display: flex;
@@ -138,8 +177,8 @@ body[data-stage="dev"] {
   flex-shrink: 0;
 }
 .gv-tool-btn:hover { color: var(--gv-textPrimary); background: var(--gv-toolHover); }
-.gv-tool-btn.active { color: #0A84FF; }
-.gv-tool-btn.active:hover { color: #3BAAFF; background: rgba(10, 132, 255, .1); }
+.gv-tool-btn.active { color: var(--gv-accent); background: var(--gv-accentSoft); }
+.gv-tool-btn.active:hover { color: var(--gv-accentHover); background: var(--gv-accentSoft); }
 
 /* Staggered reveal of tool icons. */
 .gv-pill.expanded .gv-tool-btn {
@@ -176,7 +215,8 @@ body[data-stage="dev"] {
   letter-spacing: -.01em;
 }
 .gv-tip-kbd {
-  font-size: 10px;
+  font-family: var(--gv-font-mono);
+  font-size: 9.5px;
   color: var(--gv-textFaint);
   background: var(--gv-toolHover);
   border: 1px solid var(--gv-sepColor);
@@ -195,13 +235,43 @@ body[data-stage="dev"] {
   position: absolute;
   bottom: calc(100% + 10px);
   right: 0;
-  transform-origin: bottom right;
-  animation: panelIn .28s cubic-bezier(.34, 1.4, .64, 1) forwards;
+  z-index: 1;
+  /* transform-origin is set per-panel in Panel.tsx: the tool button it belongs to. */
+  animation: panelIn .19s var(--gv-ease-out) forwards;
 }
+
+/* Maximize: grow out of the tool button. */
 @keyframes panelIn {
-  from { opacity: 0; transform: scale(.92) translateY(6px); }
-  to { opacity: 1; transform: scale(1) translateY(0); }
+  from { opacity: 0; transform: scale(.2); }
+  to { opacity: 1; transform: scale(1); }
 }
+
+/* Minimize: shrink back into it. Accelerating curve (ease-in) because a window
+   leaving should pick up speed, where one arriving should settle. */
+.gv-panel.closing {
+  animation: panelOut .16s cubic-bezier(.4, 0, 1, 1) forwards;
+  pointer-events: none;
+  /* Sits under the incoming panel during a direct tool-to-tool switch. */
+  z-index: 0;
+}
+@keyframes panelOut {
+  from { opacity: 1; transform: scale(1); }
+  to { opacity: 0; transform: scale(.2); }
+}
+
+/* Faint film grain over the panel fill so the glass doesn't read as a flat block. */
+.gv-panel::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image: var(--gv-grain);
+  background-size: 140px 140px;
+  opacity: .04;
+  pointer-events: none;
+  mix-blend-mode: overlay;
+  z-index: 0;
+}
+.gv-panel > * { position: relative; z-index: 1; }
 
 .gv-panel-hdr {
   display: flex;
@@ -210,10 +280,11 @@ body[data-stage="dev"] {
   padding: 13px 14px 0;
 }
 .gv-panel-title {
-  font-size: 11px;
-  font-weight: 600;
+  font-family: var(--gv-font-mono);
+  font-size: 10px;
+  font-weight: 500;
   color: var(--gv-titleColor);
-  letter-spacing: .06em;
+  letter-spacing: .14em;
   text-transform: uppercase;
 }
 .gv-close-btn {
@@ -256,8 +327,8 @@ body[data-stage="dev"] {
 }
 .gv-ctx-line { height: 2px; background: var(--gv-fakeLine); border-radius: 1px; }
 .gv-ctx-meta { flex: 1; min-width: 0; }
-.gv-ctx-app { font-size: 11px; font-weight: 500; color: var(--gv-textSecondary); letter-spacing: -.01em; }
-.gv-ctx-sub { font-size: 10px; color: var(--gv-textFaint); margin-top: 1px; }
+.gv-ctx-app { font-size: 11.5px; font-weight: 500; color: var(--gv-textSecondary); letter-spacing: 0; }
+.gv-ctx-sub { font-family: var(--gv-font-mono); font-size: 9.5px; color: var(--gv-textFaint); margin-top: 2px; letter-spacing: .01em; }
 
 /* File drop zone */
 .gv-drop {
@@ -271,22 +342,24 @@ body[data-stage="dev"] {
   cursor: pointer;
   transition: border-color .15s, background .15s;
 }
-.gv-drop:hover, .gv-drop.over { border-color: #0A84FF; background: rgba(10, 132, 255, .05); }
-.gv-drop-label { font-size: 11px; color: var(--gv-textFaint); letter-spacing: -.01em; }
-.gv-drop-label span { color: #0A84FF; }
+.gv-drop:hover, .gv-drop.over { border-color: var(--gv-accentBorder); background: var(--gv-accentSoft); }
+.gv-drop-label { font-size: 11px; color: var(--gv-textFaint); letter-spacing: 0; }
+.gv-drop-label span { color: var(--gv-textPrimary); font-weight: 500; }
 .gv-file-chip {
   display: flex;
   align-items: center;
   gap: 5px;
   padding: 3px 8px;
   border-radius: 6px;
-  background: rgba(10, 132, 255, .1);
-  border: 1px solid rgba(10, 132, 255, .2);
+  background: var(--gv-accentSoft);
+  border: 1px solid var(--gv-accentBorder);
+  font-family: var(--gv-font-mono);
   font-size: 10px;
-  color: #3BAAFF;
+  color: var(--gv-textPrimary);
   font-weight: 500;
 }
-.gv-file-rm { background: none; border: none; cursor: pointer; color: rgba(10, 132, 255, .5); font-size: 10px; padding: 0 0 0 2px; }
+.gv-file-rm { background: none; border: none; cursor: pointer; color: var(--gv-textFaint); font-size: 10px; padding: 0 0 0 2px; }
+.gv-file-rm:hover { color: var(--gv-textPrimary); }
 
 /* Messages */
 .gv-msgs {
@@ -306,12 +379,12 @@ body[data-stage="dev"] {
   padding: 8px 11px;
   border-radius: 12px;
   font-size: 13px;
-  line-height: 1.5;
-  letter-spacing: -.01em;
+  line-height: 1.55;
+  letter-spacing: 0;
   white-space: pre-wrap;
   word-break: break-word;
 }
-.gv-bubble-u { background: #0A84FF; color: #fff; border-bottom-right-radius: 4px; }
+.gv-bubble-u { background: var(--gv-accent); color: var(--gv-accentText); font-weight: 450; border-bottom-right-radius: 4px; }
 .gv-bubble-a {
   background: var(--gv-bubbleAiBg);
   border: 1px solid var(--gv-bubbleAiBorder);
@@ -335,6 +408,29 @@ body[data-stage="dev"] {
 .td:nth-child(3) { animation: db 1.2s .3s ease-in-out infinite; }
 @keyframes db { 0%, 60%, 100% { transform: translateY(0); opacity: .3; } 30% { transform: translateY(-4px); opacity: .9; } }
 
+/* Markdown + KaTeX inside assistant bubbles. Block elements manage their own spacing, so
+   override the bubble's pre-wrap and zero out stray first/last margins. */
+.gv-md { white-space: normal; }
+.gv-md > :first-child { margin-top: 0; }
+.gv-md > :last-child { margin-bottom: 0; }
+.gv-md p { margin: 0 0 6px; }
+.gv-md ul, .gv-md ol { margin: 4px 0 6px; padding-left: 18px; }
+.gv-md li { margin: 2px 0; }
+.gv-md li > p { margin: 0; }
+.gv-md a { color: var(--gv-textPrimary); text-decoration: underline; text-underline-offset: 2px; }
+.gv-md h1, .gv-md h2, .gv-md h3, .gv-md h4 { font-size: 13px; font-weight: 600; margin: 9px 0 4px; letter-spacing: 0; }
+.gv-md code { font-family: var(--gv-font-mono); font-size: 11.5px; background: var(--gv-accentSoft); padding: 1px 5px; border-radius: 4px; }
+.gv-md pre { background: var(--gv-ctxBg); border: 1px solid var(--gv-ctxBorder); border-radius: 8px; padding: 8px 10px; margin: 6px 0; overflow-x: auto; }
+.gv-md pre code { background: none; padding: 0; font-size: 11.5px; line-height: 1.5; }
+.gv-md pre::-webkit-scrollbar { height: 0; }
+.gv-md blockquote { margin: 6px 0; padding-left: 10px; border-left: 2px solid var(--gv-sepColor); color: var(--gv-textSecondary); }
+.gv-md table { border-collapse: collapse; margin: 6px 0; font-size: 12px; display: block; overflow-x: auto; }
+.gv-md th, .gv-md td { border: 1px solid var(--gv-sepColor); padding: 3px 7px; text-align: left; }
+.gv-md hr { border: none; border-top: 1px solid var(--gv-sepColor); margin: 8px 0; }
+.gv-md .katex { font-size: 1.02em; }
+.gv-md .katex-display { margin: 8px 0; overflow-x: auto; overflow-y: hidden; }
+.gv-md .katex-display::-webkit-scrollbar { height: 0; }
+
 /* Input row */
 .gv-input-row { display: flex; align-items: center; gap: 7px; padding: 11px 14px 13px; }
 .gv-input {
@@ -347,26 +443,27 @@ body[data-stage="dev"] {
   font-family: inherit;
   color: var(--gv-textPrimary);
   outline: none;
-  letter-spacing: -.01em;
-  transition: border-color .15s, background .15s;
+  letter-spacing: 0;
+  transition: border-color var(--gv-dur-fast), background var(--gv-dur-fast), box-shadow var(--gv-dur-fast);
 }
+.gv-input:focus { box-shadow: 0 0 0 3px var(--gv-accentSoft); }
 .gv-input::placeholder { color: var(--gv-textFaint); }
 .gv-input:focus { border-color: var(--gv-inputFocus); background: var(--gv-ctxBg); }
 .gv-send {
   width: 30px;
   height: 30px;
   border-radius: 8px;
-  background: #0A84FF;
+  background: var(--gv-accent);
   border: none;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  transition: background .15s, transform .15s;
-  box-shadow: 0 2px 8px rgba(10, 132, 255, .35);
+  transition: background var(--gv-dur-fast), transform var(--gv-dur-fast), box-shadow var(--gv-dur-fast);
+  box-shadow: 0 2px 10px var(--gv-accentGlow);
 }
-.gv-send:hover { background: #2196ff; transform: scale(1.06); }
+.gv-send:hover { background: var(--gv-accentHover); transform: scale(1.06); box-shadow: 0 3px 14px var(--gv-accentGlow); }
 .gv-send:disabled { opacity: .35; cursor: default; transform: none; }
 .gv-attach-btn {
   width: 30px;
@@ -435,15 +532,34 @@ body[data-stage="dev"] {
 .gv-hist-item:hover { background: var(--gv-histHover); }
 .gv-hist-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .gv-hist-title { font-size: 12px; font-weight: 500; color: var(--gv-textSecondary); letter-spacing: -.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
-.gv-hist-time { font-size: 10px; color: var(--gv-textFaint); flex-shrink: 0; }
+.gv-hist-time { font-family: var(--gv-font-mono); font-size: 9.5px; color: var(--gv-textFaint); flex-shrink: 0; letter-spacing: .01em; }
 .gv-hist-preview { font-size: 11px; color: var(--gv-textFaint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .gv-hist-empty { padding: 18px 14px; text-align: center; font-size: 12px; color: var(--gv-textFaint); }
+/* Delete stays hidden until the row is hovered so the list reads calmly. */
+.gv-hist-del {
+  flex-shrink: 0; border: none; background: none; cursor: pointer;
+  color: var(--gv-textFaint); padding: 2px 4px; border-radius: 5px;
+  display: flex; align-items: center; font-size: 10px;
+  font-family: var(--gv-font-mono); letter-spacing: .04em;
+  opacity: 0; transition: opacity var(--gv-dur-fast), color var(--gv-dur-fast), background var(--gv-dur-fast);
+}
+.gv-hist-item:hover .gv-hist-del { opacity: 1; }
+.gv-hist-del:hover { color: var(--gv-warnIcon); background: var(--gv-accentSoft); }
+.gv-hist-del.confirm { opacity: 1; color: var(--gv-warnIcon); background: var(--gv-errorBg); }
+
+/* Attachment thumbnail inside a message bubble. */
+.gv-attach-img {
+  display: block; max-width: 100%; max-height: 140px; width: auto;
+  border-radius: 8px; margin-bottom: 6px; object-fit: contain;
+  border: 1px solid var(--gv-panelBorder);
+}
+.gv-drop-error { color: var(--gv-errorText); }
 
 /* Settings */
 .gv-settings { padding: 13px; display: flex; flex-direction: column; gap: 12px; max-height: 360px; overflow-y: auto; }
 .gv-settings::-webkit-scrollbar { width: 0; }
 .gv-sg { display: flex; flex-direction: column; gap: 6px; }
-.gv-sg-label { font-size: 10px; font-weight: 600; color: var(--gv-textFaint); letter-spacing: .07em; text-transform: uppercase; padding: 0 2px; }
+.gv-sg-label { font-family: var(--gv-font-mono); font-size: 9.5px; font-weight: 500; color: var(--gv-textFaint); letter-spacing: .14em; text-transform: uppercase; padding: 0 2px; }
 .gv-sr {
   display: flex;
   align-items: center;
@@ -467,7 +583,7 @@ body[data-stage="dev"] {
   color: var(--gv-textFaint);
   transition: all .15s;
 }
-.gv-theme-btn.on { border-color: #0A84FF; background: rgba(10, 132, 255, .12); color: #0A84FF; }
+.gv-theme-btn.on { border-color: var(--gv-accentBorder); background: var(--gv-accentSoft); color: var(--gv-textPrimary); }
 .gv-toggle {
   width: 32px;
   height: 18px;
@@ -479,7 +595,7 @@ body[data-stage="dev"] {
   flex-shrink: 0;
   border: none;
 }
-.gv-toggle.on { background: #0A84FF; }
+.gv-toggle.on { background: var(--gv-accent); }
 .gv-toggle::after {
   content: '';
   position: absolute;
@@ -492,7 +608,7 @@ body[data-stage="dev"] {
   transition: transform .2s cubic-bezier(.34, 1.56, .64, 1);
   box-shadow: 0 1px 4px rgba(0, 0, 0, .3);
 }
-.gv-toggle.on::after { transform: translateX(14px); }
+.gv-toggle.on::after { transform: translateX(14px); background: var(--gv-accentText); }
 .gv-api-input {
   flex: 1;
   background: var(--gv-inputBg);
@@ -508,50 +624,25 @@ body[data-stage="dev"] {
 }
 .gv-api-input::placeholder { color: var(--gv-textFaint); }
 .gv-api-input:focus { border-color: var(--gv-inputFocus); }
-.gv-api-badge { font-size: 9px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; flex-shrink: 0; }
+.gv-api-badge { font-family: var(--gv-font-mono); font-size: 9px; font-weight: 500; letter-spacing: .08em; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; flex-shrink: 0; }
 .gv-api-badge.ollama { background: rgba(52, 199, 89, .12); color: #34C759; border: 1px solid rgba(52, 199, 89, .2); }
 .gv-api-badge.openai { background: rgba(10, 132, 255, .12); color: #0A84FF; border: 1px solid rgba(10, 132, 255, .2); }
 .gv-api-badge.anthropic { background: rgba(242, 169, 59, .12); color: #F2A93B; border: 1px solid rgba(242, 169, 59, .2); }
+.gv-api-badge.deepseek { background: rgba(77, 107, 254, .12); color: #4D6BFE; border: 1px solid rgba(77, 107, 254, .2); }
 .gv-kbd-input {
-  width: 110px;
+  width: 120px;
   background: var(--gv-inputBg);
   border: 1px solid var(--gv-inputBorder);
   border-radius: 7px;
   padding: 5px 9px;
   text-align: center;
   font-size: 11px;
-  font-family: inherit;
+  font-family: var(--gv-font-mono);
+  letter-spacing: .02em;
   color: var(--gv-textPrimary);
   outline: none;
 }
 .gv-kbd-input:focus { border-color: var(--gv-inputFocus); }
-
-/* Voice */
-.gv-voice { display: flex; flex-direction: column; align-items: center; padding: 28px 14px 22px; gap: 14px; }
-.voice-ring { position: relative; width: 72px; height: 72px; display: flex; align-items: center; justify-content: center; }
-.vring { position: absolute; inset: 0; border-radius: 50%; border: 1.5px solid rgba(10, 132, 255, .3); }
-.vring:nth-child(1) { animation: rp 1.8s 0s ease-in-out infinite; }
-.vring:nth-child(2) { animation: rp 1.8s .6s ease-in-out infinite; }
-.vring:nth-child(3) { animation: rp 1.8s 1.2s ease-in-out infinite; }
-@keyframes rp { 0%, 100% { transform: scale(1); opacity: .3; } 50% { transform: scale(1.2); opacity: .7; } }
-.voice-btn {
-  width: 52px;
-  height: 52px;
-  border-radius: 50%;
-  background: rgba(10, 132, 255, .12);
-  border: 1.5px solid rgba(10, 132, 255, .35);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #0A84FF;
-  cursor: pointer;
-  z-index: 1;
-  transition: background .15s, border-color .15s;
-}
-.voice-btn.rec { background: rgba(255, 69, 58, .12); border-color: rgba(255, 69, 58, .4); color: #FF453A; animation: vp .8s ease-in-out infinite; }
-@keyframes vp { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.06); } }
-.voice-transcript { font-size: 13px; color: var(--gv-textSecondary); text-align: center; letter-spacing: -.01em; line-height: 1.5; min-height: 36px; }
-.voice-label { font-size: 11px; color: var(--gv-textFaint); letter-spacing: -.01em; }
 
 /* Region selection (rendered inside the main window when in region mode) */
 .region-overlay { position: fixed; inset: 0; z-index: 9000; cursor: crosshair; overflow: hidden; }
@@ -567,8 +658,8 @@ body[data-stage="dev"] {
 .region-hint-t { font-size: 14px; font-weight: 600; color: rgba(255, 255, 255, .85); letter-spacing: -.02em; }
 .region-hint-s { font-size: 11px; color: rgba(255, 255, 255, .35); margin-top: 3px; }
 .region-sel {
-  position: absolute; border: 2px solid #0A84FF; background: rgba(10, 132, 255, .08);
-  border-radius: 4px; box-shadow: 0 0 0 1px rgba(10, 132, 255, .25); pointer-events: none;
+  position: absolute; border: 1.5px solid #FAFAFA; background: rgba(255, 255, 255, .06);
+  border-radius: 4px; box-shadow: 0 0 0 1px rgba(0, 0, 0, .55), 0 0 0 3px rgba(255, 255, 255, .12); pointer-events: none;
 }
 .region-cancel {
   position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%);
@@ -578,3 +669,13 @@ body[data-stage="dev"] {
   cursor: pointer; font-family: inherit;
 }
 .region-cancel:hover { color: rgba(255, 255, 255, .9); }
+
+/* Respect reduced-motion: keep state changes instant, drop looping/decorative motion. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

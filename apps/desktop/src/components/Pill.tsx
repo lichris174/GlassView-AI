@@ -1,5 +1,6 @@
 import { GLogo } from "./GLogo";
 import { Toolbar } from "./Toolbar";
+import { TOOLS } from "./tools";
 import type { ToolId } from "../types";
 
 interface PillProps {
@@ -25,7 +26,11 @@ export function Pill({
   onDragMouseDown,
 }: PillProps) {
   return (
-    <div className={`gv-pill${expanded ? " expanded" : ""}`} onMouseDown={onDragMouseDown}>
+    <div
+      className={`gv-pill${expanded ? " expanded" : ""}`}
+      onMouseDown={onDragMouseDown}
+      style={{ "--tool-count": TOOLS.length } as React.CSSProperties}
+    >
       {/* Scaled background shell: visually grows from the logo outward while the
           content layout stays stable. */}
       <div className="gv-pill-bg" aria-hidden="true" />

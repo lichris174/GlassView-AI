@@ -19,6 +19,12 @@ const DEFAULT_SHORTCUT: &str = "Ctrl+Shift+Space";
 fn main() {
     tauri::Builder::default()
         .plugin(GlobalShortcutBuilder::new().build())
+        // Launch-on-login. The frontend toggles it through the plugin's own
+        // commands; MacosLauncher is irrelevant on Windows but required by the API.
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .invoke_handler(tauri::generate_handler![
             capture::log_frontend,
             capture::capture_screen,

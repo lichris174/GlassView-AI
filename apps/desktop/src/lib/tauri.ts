@@ -32,6 +32,20 @@ export const disarmRegionEscape = () =>
 export const registerShortcut = (accelerator: string) =>
   isTauri() ? invoke("register_shortcut", { accelerator }) : Promise.resolve();
 
+// ── Launch on login (tauri-plugin-autostart) ────────────────────────────────
+// Called through the plugin's command names rather than its JS package so the
+// browser build needs no extra dependency to tree-shake away.
+export async function setAutostart(on: boolean): Promise<void> {
+  if (!isTauri()) return;
+  await invoke(on ? "plugin:autostart|enable" : "plugin:autostart|disable");
+}
+
+/** The OS is the source of truth — the stored setting is only a cache of it. */
+export async function isAutostartEnabled(): Promise<boolean> {
+  if (!isTauri()) return false;
+  return invoke<boolean>("plugin:autostart|is_enabled");
+}
+
 /** Full-screen the overlay for region selection (and back). Suppresses anchor tracking
  *  so the fullscreen move doesn't clobber the pill's resting position. */
 export async function setFullscreen(on: boolean): Promise<void> {
@@ -67,10 +81,16 @@ let lastH = 0;
 // horizontally every time a panel opens.
 const MIN_CONTENT_WIDTH = 342;
 
-/** Measure pill + panel (transform-independent) → the CSS box the window must cover. */
+/** Measure pill + panel (transform-independent) → the CSS box the window must cover.
+ *
+ *  Mid-switch two panels are mounted: the outgoing one minimizing and the incoming
+ *  one maximizing. Size to the incoming panel (`:not(.closing)`) so the window
+ *  lands on the box it is about to need. offsetHeight ignores the scale transform,
+ *  so the size is the panel's final one from the first frame — the window is
+ *  correct before the animation plays, and the extra area is transparent anyway. */
 function contentSize(wrap: HTMLElement): { w: number; h: number } {
   const pill = wrap.querySelector<HTMLElement>(".gv-pill");
-  const panel = wrap.querySelector<HTMLElement>(".gv-panel");
+  const panel = wrap.querySelector<HTMLElement>(".gv-panel:not(.closing)");
   const pw = pill?.offsetWidth ?? 0;
   const ph = pill?.offsetHeight ?? 0;
   const naW = panel?.offsetWidth ?? 0;
@@ -106,12 +126,19 @@ export async function fitWindowToContent(wrap: HTMLElement): Promise<void> {
   const top = Math.max(my + margin, anchor.y - hp);
 
   programmatic = true;
-  if (wp !== lastW || hp !== lastH) {
-    await win.setSize(new PhysicalSize(wp, hp));
-    lastW = wp;
-    lastH = hp;
+  const sizeChanged = wp !== lastW || hp !== lastH;
+  // Order the two ops by growth direction so the bottom edge (where the pill sits) never
+  // overshoots mid-resize — that overshoot is what made the toolbar flash. Growing: move the
+  // top up first, then extend height down to it. Shrinking: trim height first, then settle.
+  if (hp > lastH) {
+    await win.setPosition(new PhysicalPosition(left, top));
+    if (sizeChanged) await win.setSize(new PhysicalSize(wp, hp));
+  } else {
+    if (sizeChanged) await win.setSize(new PhysicalSize(wp, hp));
+    await win.setPosition(new PhysicalPosition(left, top));
   }
-  await win.setPosition(new PhysicalPosition(left, top));
+  lastW = wp;
+  lastH = hp;
   setTimeout(() => { programmatic = false; }, 60);
 }
 

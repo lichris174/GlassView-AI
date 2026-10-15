@@ -1,12 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Pill } from "./components/Pill";
 import { TOOLS } from "./components/tools";
-import { Panel } from "./components/panels/Panel";
+import { Panel, type PanelOrigin } from "./components/panels/Panel";
 import { ChatPanel } from "./components/panels/ChatPanel";
 import { HistoryPanel } from "./components/panels/HistoryPanel";
 import { SettingsPanel } from "./components/panels/SettingsPanel";
 import { ErrorPanel } from "./components/panels/ErrorPanel";
-import { VoicePanel } from "./components/panels/VoicePanel";
 import { RegionSelect } from "./components/RegionSelect";
 import { useDrag } from "./hooks/useDrag";
 import { useTheme } from "./hooks/useTheme";
@@ -16,19 +15,30 @@ import { useChat } from "./hooks/useChat";
 import {
   isTauri, startDragging, fitWindowToContent, registerShortcut, watchWindowMoves,
   onToggleOverlay, onRegionCancel, captureScreen, setFullscreen,
-  armRegionEscape, disarmRegionEscape,
+  armRegionEscape, disarmRegionEscape, setAutostart, isAutostartEnabled,
 } from "./lib/tauri";
 import type { ToolId } from "./types";
 
 const TITLES: Record<ToolId, string> = {
   chat: "Chat",
   region: "Region",
-  voice: "Voice",
   history: "Past Chats",
   settings: "Settings",
 };
 
 const TAURI = isTauri();
+
+// Must match the .gv-panel.closing animation duration in global.css.
+const PANEL_EXIT_MS = 160;
+
+interface LivePanel {
+  tool: ToolId;
+  origin: PanelOrigin;
+  closing: boolean;
+}
+
+/** Fallback origin (panel's own bottom-right) if the button can't be measured. */
+const FALLBACK_ORIGIN: PanelOrigin = { x: 320, dy: 30 };
 
 export default function App() {
   const { theme, setTheme } = useTheme();
@@ -37,21 +47,32 @@ export default function App() {
 
   const [expanded, setExpanded] = useState(false);
   const [activeTool, setActiveTool] = useState<ToolId | null>(null);
+  // Live panels. More than one exists only mid-switch, when the outgoing panel is
+  // still minimizing while the incoming one maximizes.
+  const [panels, setPanels] = useState<LivePanel[]>([]);
   const [hasNotif, setHasNotif] = useState(false);
   const [regionImage, setRegionImage] = useState<string | null>(null);
   const activeRef = useRef<ToolId | null>(null);
   activeRef.current = activeTool;
   const wrapRef = useRef<HTMLDivElement>(null);
 
-  const chat = useChat(() => {
-    if (activeRef.current !== "chat") setHasNotif(true);
+  const chat = useChat({
+    streaming: settings.streaming,
+    redact: settings.privacy,
+    provider: settings.provider,
+    apiKey: settings.provider === "ollama" ? "" : apiKey,
+    onDone: () => {
+      if (activeRef.current !== "chat") setHasNotif(true);
+    },
   });
   const chatRef = useRef(chat);
   chatRef.current = chat;
 
+  // Browser-only resting spot. The pill is 226px wide / 42px tall; keep a ~16px margin so
+  // it never starts clipped against the right/bottom edge (Tauri pins right:0 bottom:0).
   const { pos, moved, onMouseDown: jsDrag } = useDrag({
-    x: window.innerWidth - 220,
-    y: window.innerHeight - 80,
+    x: window.innerWidth - 242,
+    y: window.innerHeight - 64,
   });
 
   useEffect(() => {
@@ -74,18 +95,44 @@ export default function App() {
     const wrap = wrapRef.current;
     if (!wrap) return;
     let raf = 0;
-    let timer = 0;
     const fit = () => fitWindowToContent(wrap);
+    // Coalesce bursts into a single fit on the next frame — no extra timeout, so the
+    // window resizes on the same frame the panel mounts (avoids a one-frame blank where
+    // the toolbar flashes before the grown window catches up).
     const ro = new ResizeObserver(() => {
       cancelAnimationFrame(raf);
-      clearTimeout(timer);
-      // Coalesce rapid frames (CSS animation) into one call at the end
-      timer = window.setTimeout(() => { raf = requestAnimationFrame(fit); }, 32);
+      raf = requestAnimationFrame(fit);
     });
     wrap.querySelectorAll(".gv-pill, .gv-panel").forEach((el) => ro.observe(el));
     requestAnimationFrame(fit);
-    return () => { ro.disconnect(); clearTimeout(timer); cancelAnimationFrame(raf); };
-  }, [expanded, activeTool, regionImage]);
+    return () => { ro.disconnect(); cancelAnimationFrame(raf); };
+  }, [expanded, activeTool, panels, regionImage]);
+
+  // Launch-on-login: the OS registration is the source of truth, so adopt it on
+  // startup rather than trusting the stored setting (the user may have changed it
+  // elsewhere, or the registration may have failed last time).
+  useEffect(() => {
+    if (!TAURI) return;
+    isAutostartEnabled()
+      .then((on) => update("autoLaunch", on))
+      .catch((err) => console.error("[autostart] read failed:", err));
+    // Intentionally mount-only: this seeds the setting from the OS.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Apply changes to launch-on-login. Skipped until the initial read above has
+  // settled, so seeding the value cannot immediately re-write it.
+  const autoLaunchSynced = useRef(false);
+  useEffect(() => {
+    if (!TAURI) return;
+    if (!autoLaunchSynced.current) {
+      autoLaunchSynced.current = true;
+      return;
+    }
+    setAutostart(settings.autoLaunch).catch((err) =>
+      console.error("[autostart] write failed:", err),
+    );
+  }, [settings.autoLaunch]);
 
   // Rebind the global shortcut when it changes (native only).
   useEffect(() => {
@@ -198,6 +245,48 @@ export default function App() {
 
   const closePanel = useCallback(() => setActiveTool(null), []);
 
+  /**
+   * Where the panel should scale from: the centre of the tool button that owns it,
+   * expressed relative to the panel box. The panel is absolutely positioned with
+   * `right: 0; bottom: calc(100% + 10px)`, so its bottom edge sits 10px above the
+   * wrapper and its left edge is `panelWidth` in from the wrapper's right edge.
+   */
+  const originFor = useCallback((tool: ToolId): PanelOrigin => {
+    const wrap = wrapRef.current;
+    const btn = wrap?.querySelector<HTMLElement>(`[data-tool="${tool}"]`);
+    if (!wrap || !btn) return FALLBACK_ORIGIN;
+    const w = wrap.getBoundingClientRect();
+    const b = btn.getBoundingClientRect();
+    const panelW = wrap.querySelector<HTMLElement>(".gv-panel")?.offsetWidth ?? 340;
+    return {
+      x: b.left + b.width / 2 - (w.right - panelW),
+      dy: b.top + b.height / 2 - (w.top - 10),
+    };
+  }, []);
+
+  useEffect(() => {
+    setPanels((prev) => {
+      const closing = prev.map((p) => ({ ...p, closing: true }));
+      if (!activeTool) return closing;
+      // Drop any stale copy of the incoming tool so it remounts and replays its
+      // maximize animation rather than being reconciled in place.
+      return [
+        ...closing.filter((p) => p.tool !== activeTool),
+        { tool: activeTool, origin: originFor(activeTool), closing: false },
+      ];
+    });
+  }, [activeTool, originFor]);
+
+  // Retire panels once they have finished minimizing.
+  useEffect(() => {
+    if (!panels.some((p) => p.closing)) return;
+    const t = setTimeout(
+      () => setPanels((ps) => ps.filter((p) => !p.closing)),
+      PANEL_EXIT_MS,
+    );
+    return () => clearTimeout(t);
+  }, [panels]);
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (!expanded) return;
@@ -241,54 +330,58 @@ export default function App() {
     chatRef.current.send("What's in this region?", cropped);
   }, [exitRegion]);
 
+  const onChatDeleted = useCallback((id: string) => {
+    // If the deleted chat is the one loaded in the Chat panel, clear it so the
+    // panel isn't showing a transcript the backend no longer has.
+    if (chatRef.current.chatId === id) chatRef.current.reset();
+  }, []);
+
   const openHistoryChat = useCallback((id: string) => {
     chatRef.current.load(id);
     setActiveTool("chat");
   }, []);
 
-  const renderPanel = () => {
-    if (!activeTool) return null;
-    if (activeTool === "chat" && healthError) {
+  const panelBody = (tool: ToolId) => {
+    // The Ollama health check only gates chat when Ollama is the provider —
+    // a cloud key answers fine with the local daemon stopped.
+    if (tool === "chat" && healthError && settings.provider === "ollama") {
+      return <ErrorPanel onOpenSettings={() => setActiveTool("settings")} />;
+    }
+    if (tool === "chat") {
       return (
-        <Panel title={TITLES.chat} onClose={closePanel}>
-          <ErrorPanel onOpenSettings={() => setActiveTool("settings")} />
-        </Panel>
+        <ChatPanel
+          messages={chat.messages}
+          thinking={chat.thinking}
+          streaming={chat.streaming}
+          streamText={chat.streamText}
+          busy={chat.busy}
+          onSend={chat.send}
+        />
       );
     }
-    return (
-      <Panel title={TITLES[activeTool]} onClose={closePanel}>
-        {activeTool === "chat" && (
-          <ChatPanel
-            messages={chat.messages}
-            thinking={chat.thinking}
-            streaming={chat.streaming}
-            streamText={chat.streamText}
-            busy={chat.busy}
-            onSend={chat.send}
-          />
-        )}
-        {activeTool === "history" && <HistoryPanel onOpen={openHistoryChat} visible={activeTool === "history"} />}
-        {activeTool === "voice" && (
-          <VoicePanel
-            onTranscript={(text) => {
-              setActiveTool("chat");
-              chat.send(text);
-            }}
-          />
-        )}
-        {activeTool === "settings" && (
-          <SettingsPanel
-            settings={settings}
-            update={update}
-            theme={theme}
-            setTheme={setTheme}
-            apiKey={apiKey}
-            setApiKey={setApiKey}
-            model={model}
-          />
-        )}
-      </Panel>
-    );
+    if (tool === "history") {
+      return (
+        <HistoryPanel
+          onOpen={openHistoryChat}
+          onDeleted={onChatDeleted}
+          visible={activeTool === "history"}
+        />
+      );
+    }
+    if (tool === "settings") {
+      return (
+        <SettingsPanel
+          settings={settings}
+          update={update}
+          theme={theme}
+          setTheme={setTheme}
+          apiKey={apiKey}
+          setApiKey={setApiKey}
+          model={model}
+        />
+      );
+    }
+    return null;
   };
 
   // Browser: float at the JS-drag position. Native: pin bottom-right of the fitted window.
@@ -302,7 +395,17 @@ export default function App() {
         <RegionSelect image={regionImage} onDone={onRegionDone} onCancel={exitRegion} />
       )}
       <div className="gv-wrap" ref={wrapRef} style={wrapStyle}>
-        {renderPanel()}
+        {panels.map((p) => (
+          <Panel
+            key={p.tool}
+            title={TITLES[p.tool]}
+            onClose={closePanel}
+            origin={p.origin}
+            closing={p.closing}
+          >
+            {panelBody(p.tool)}
+          </Panel>
+        ))}
         <Pill
           expanded={expanded}
           activeTool={activeTool}

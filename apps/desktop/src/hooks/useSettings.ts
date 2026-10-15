@@ -5,6 +5,7 @@ const KEY = "glassview.settings";
 const API_KEY = "glassview.apiKey";
 
 const DEFAULTS: Settings = {
+  provider: "ollama",
   shortcut: "Ctrl+Shift+Space",
   closeOnBlur: true,
   autoLaunch: false,
@@ -13,13 +14,24 @@ const DEFAULTS: Settings = {
   autoContext: true,
 };
 
-/** Detect provider from an API-key prefix (brief's detectProvider). */
+/**
+ * Guess a provider from an API-key prefix. Only a hint for pre-selecting the
+ * picker — DeepSeek is unreachable this way because its keys also start with
+ * "sk-". The user's explicit choice in Settings is what actually dispatches.
+ */
 export function detectProvider(key: string): Provider {
   if (!key) return "ollama";
   if (key.startsWith("sk-ant-")) return "anthropic";
   if (key.startsWith("sk-")) return "openai";
   return "ollama";
 }
+
+export const PROVIDER_LABELS: Record<Provider, string> = {
+  ollama: "Ollama",
+  openai: "OpenAI",
+  anthropic: "Anthropic",
+  deepseek: "DeepSeek",
+};
 
 /** Settings + API key, persisted to localStorage and re-applied on load. */
 export function useSettings() {

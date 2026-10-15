@@ -17,6 +17,7 @@ export function Toolbar({ open, activeTool, onToggle }: ToolbarProps) {
       {TOOLS.map((tool, i) => (
         <button
           key={tool.id}
+          data-tool={tool.id}
           className={`gv-tool-btn${activeTool === tool.id ? " active" : ""}`}
           style={{ "--tool-index": i } as React.CSSProperties}
           onMouseDown={(e) => e.stopPropagation()}
