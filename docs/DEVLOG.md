@@ -202,3 +202,76 @@ straddling splits, frozen test set, tamper detection). Smoke-tested both CLIs on
 capture, then deleted the frames.
 
 **Next (manual):** capture sessions per the collection plan, review, freeze the split, label.
+
+---
+
+## 2026-10-15 — Phase 2: eval harness and baselines
+
+### What gets measured, and why these metrics
+The app blurs every predicted box regardless of its class, so the headline metrics are
+**class-agnostic on the prediction side** (`ml/metrics.py`):
+
+| Metric | Meaning | Why |
+|---|---|---|
+| Region recall | Share of labeled regions at least 90% covered by blur | The safety number: did the secret leak? |
+| Pixel recall | Share of sensitive pixels blurred | Partial credit view of the same |
+| Blur precision | Share of blurred pixels that were sensitive | Over-blurring costs answer quality |
+| Clean-frame false-blur rate | Share of harmless frames that get anything blurred | Cost in block mode; measured on the ~1/3 empty frames |
+| Sensitive-frame recall | Share of sensitive frames with any box | The block-mode safety number |
+| AP@0.5 per class, mAP@0.5 | Standard detection metric (PASCAL VOC) | What ML readers expect to compare |
+
+"90% covered" is a parameter recorded in every run. A secret 90% blurred can still leak its edges,
+so results can be rescored at stricter coverage without rerunning a model.
+
+### Making the numbers defensible
+- **Session-cluster bootstrap.** Confidence intervals resample whole capture sessions, not frames.
+  Frames in a session are near-copies; treating them as independent evidence would make intervals
+  look tighter than the data supports.
+- **Paired comparisons.** `ml.evaluate compare` resamples the *same* sessions for both systems, so
+  "detector beats OCR by N points" comes with an interval on the difference itself.
+- **Threshold chosen on val, never test.** `--threshold-from <val run> --target-recall 0.95` records
+  where the threshold came from in the manifest; `pick-threshold` refuses a test run.
+- **Run folders** (`results/<stamp>-<system>-<split>/`): manifest with git commit + dirty flag, the
+  frozen split hash, a hash of the labels, system config (e.g. Ollama model *digest*, not just the
+  tag, and a prompt hash), machine and GPU; full predictions; metrics with intervals. Rescoring
+  flags labels edited after the run.
+
+### Baselines (`ml/baselines/`)
+- `block_all`: blur everything. Recall 100% and false-blur 100% by construction; the floor.
+- `ocr_regex`: Tesseract word boxes + the app's existing redaction rules, i.e. what GlassView does
+  today. Run with default Tesseract settings, untuned, to represent what ships. Cannot see faces,
+  and has no rule for private messages, so those classes score 0 by design.
+- `qwen_vl`: qwen3-vl 8B via Ollama, zero-shot, temperature 0, given the same class definitions as
+  the labeling guide, answering JSON boxes on Qwen3-VL's 0-1000 coordinate grid. It gives no
+  confidence scores, so its AP is a single operating point; the privacy metrics are the fair
+  comparison.
+
+### Review
+A Sonnet reviewer read the harness cold and confirmed the geometry, ratios, and bootstrap. Fixed
+from its findings, each with a regression test:
+- **AP was computed on threshold-filtered predictions**, which truncates the precision-recall curve
+  and understates mAP. AP now uses all predictions; only privacy metrics use the threshold.
+- **Scores were rounded to 2 decimals** in saved predictions, creating ties that shift AP and the
+  picked threshold. Scores are now stored at full precision.
+- **Tied scores made AP depend on frame order** for constant-score baselines. PR points are now
+  emitted only between distinct scores.
+- Matching switched to strict VOC (a prediction whose best-overlap ground truth is taken is a false
+  positive); the previous greedy match was slightly generous.
+- `choose_threshold` now reports when the target recall is unreachable instead of silently
+  returning the lowest threshold.
+- Labels are hashed into the manifest; `compare` refuses runs from different splits; frames
+  labeled after a partial run are skipped and counted instead of crashing.
+- The Qwen reply parser salvages complete boxes from replies cut off by the token limit and counts
+  unparseable replies in the manifest, so lost recall from formatting is visible.
+- Label import writes an empty label for exported images with no boxes, so clean frames are not
+  mistaken for unlabeled ones (which would shrink the false-blur denominator).
+
+The reviewer also noted that with ~10 test sessions, percentile intervals are approximate. Runs
+report `num_sessions` next to every interval.
+
+### Status
+103 tests pass. The qwen baseline was verified up to the model call (model digest and config
+resolved); the live call failed with Ollama's "model requires more system memory (3.2 GiB) than is
+available (2.6 GiB)". That is free RAM at the time, not a code problem: close memory-heavy apps
+before running `make baselines`. Grounding DINO / OWLv2 is deferred to Phase 3, which sets up the
+PyTorch environment anyway.
