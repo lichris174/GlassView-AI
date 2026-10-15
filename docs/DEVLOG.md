@@ -85,3 +85,79 @@ Commits:
 - `08ddb0a` docs: update README/handoff, add frontend brief
 
 Next: critical bug fixes, each as its own commit with a test.
+
+---
+
+## 2026-10-14 — Phase 0: critical bug fixes
+
+### 1. Any website could drive the local API
+**Bug.** The backend allowed CORS from `*` with no auth. A page open in the user's browser could
+call `127.0.0.1:8765` to read every chat (including screenshots), delete history, or send prompts.
+
+**Fix.** Two layers:
+- *Origin allowlist* (`config.allowed_origins()`): only the Vite dev server and the Tauri webview
+  origins. Browsers block other sites from reading responses and from sending preflighted requests
+  (`DELETE`, JSON `POST`).
+- *Host check* (`TrustedHostMiddleware`, loopback only). This blocks DNS rebinding, where an
+  attacker's domain re-resolves to `127.0.0.1` so the browser treats it as same-origin and CORS
+  never applies. The `Host` header still carries the attacker's domain, so it is rejected.
+
+**Considered, skipped:** a per-session auth token. It defends against other programs on the same
+machine, but those already run as the user and can read `glassview.db` directly, so the token
+would add complexity without closing a real gap.
+
+**Tests:** desktop origin allowed; foreign origin gets no CORS header and a failed preflight;
+non-loopback `Host` returns 400.
+
+### 2. Backend refused to start without Ollama
+**Bug.** Startup called `detect_model()`, which raised if Ollama was not running, even for users
+on a cloud provider who never touch the local model. `/health` also never re-checked, so starting
+Ollama later required restarting the backend.
+
+**Fix.** A missing model is now recorded (`model=None`, `model_error`) instead of crashing.
+`/health` re-probes Ollama on each poll (in a worker thread, so a slow daemon can't stall other
+requests) and reports `"degraded"` with the reason. Local `/chat` and `/agent` return `503` with
+that reason; cloud providers work regardless. The offline eval runner still requires a real model
+(`load_settings(require_model=True)`).
+
+### 3. Typing during a reply triggered tool shortcuts
+**Bug.** The chat input was `disabled` while a reply streamed. Disabling an element drops its
+focus to the page, so the next letters typed hit the global C/R/H/S tool hotkeys and opened
+other panels.
+
+**Fix.** The input stays enabled (sending is still blocked while busy, so the next question can be
+typed early). The hotkey handler now ignores any text-entry target and any Ctrl/Alt/Meta combo.
+
+### 4. Cancelled replies leaked into other chats
+**Bug.** `useChat` used one shared `cancelled` flag and never aborted the HTTP request. Opening a
+different chat mid-reply set the flag, but a new turn reset it, so the old stream could append its
+`[cancelled]` text into the newly opened chat. The old request also kept generating in the
+background.
+
+**Fix.** Each turn gets a generation number and its own `AbortController`. Switching or resetting
+the chat bumps the generation and aborts the request; a turn only touches state if it is still the
+current generation. On the backend, an aborted stream now saves the partial answer marked
+`[cancelled]`. The save is wrapped in `asyncio.shield` because the request task is being cancelled
+at that moment, and an unshielded `await` would silently drop the turn.
+
+**Tests:** backend test closes the stream after the first token and checks the turn is stored as
+`Hello\n\n[cancelled]`. The frontend has no test runner yet; these changes were verified with
+`tsc` and a production build.
+
+**Results:** `pytest` 71 passed, `ruff` clean, `tsc` clean, `vite build` OK.
+
+### Independent review
+A separate reviewer agent read the diff cold. It confirmed the Tauri origins, middleware order,
+provider resolution, and the `asyncio.shield` handling, and found nothing blocking. Fixed from its
+findings:
+- `POST /chats/{id}/clear` takes no body, so a cross-site page could send it as a "simple" request
+  that skips the CORS preflight. Bodyless POSTs now require `Content-Type: application/json`
+  (415 otherwise), which forces a preflight. *Test added.*
+- With focus now staying in the chat field, Escape stopped closing the panel. Escape is handled
+  before the text-entry check.
+- If loading a chat from History failed right after cancelling a reply, the busy flags were never
+  cleared and the input stayed locked. Cancelling now clears them itself.
+- Two sends in the same render tick could both pass the `busy` check. `send` also checks the
+  in-flight request ref.
+
+**Results:** `pytest` 72 passed, `ruff` clean, `tsc` clean.
