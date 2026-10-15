@@ -35,11 +35,43 @@ SYSTEM_PROMPT = (
 )
 
 
+# Origins the desktop UI is served from: the Vite dev server, and the Tauri v2
+# webview (http://tauri.localhost on Windows, tauri://localhost on macOS/Linux).
+_DEFAULT_ORIGINS = (
+    "http://localhost:1420",
+    "http://127.0.0.1:1420",
+    "http://tauri.localhost",
+    "https://tauri.localhost",
+    "tauri://localhost",
+)
+_DEFAULT_HOSTS = ("127.0.0.1", "localhost")
+
+
+def _env_list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
+def allowed_origins() -> tuple[str, ...]:
+    """Browser origins allowed to call the API (override: GLASSVIEW_ALLOWED_ORIGINS)."""
+    return _env_list("GLASSVIEW_ALLOWED_ORIGINS", _DEFAULT_ORIGINS)
+
+
+def allowed_hosts() -> tuple[str, ...]:
+    """Host headers accepted (override: GLASSVIEW_ALLOWED_HOSTS). Loopback only."""
+    return _env_list("GLASSVIEW_ALLOWED_HOSTS", _DEFAULT_HOSTS)
+
+
 @dataclass(frozen=True)
 class Settings:
     ollama_host: str
-    model: str
+    # None when Ollama is down or has no vision model at startup. The app still
+    # serves cloud providers and history; the local model is re-detected later.
+    model: str | None
     db_path: str
+    model_error: str | None = None
 
 
 class ModelNotFoundError(RuntimeError):
@@ -98,10 +130,15 @@ def detect_model(host: str | None = None, override: str | None = None) -> str:
     )
 
 
-def load_settings() -> Settings:
+def load_settings(*, require_model: bool = False) -> Settings:
+    """Resolve settings. A missing local model is recorded, not fatal, unless
+    ``require_model`` is set (the offline eval runner needs a real model)."""
     host = os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
-    return Settings(
-        ollama_host=host,
-        model=detect_model(host),
-        db_path=os.environ.get("GLASSVIEW_DB", DEFAULT_DB_PATH),
-    )
+    db_path = os.environ.get("GLASSVIEW_DB", DEFAULT_DB_PATH)
+    try:
+        model, error = detect_model(host), None
+    except ModelNotFoundError as exc:
+        if require_model:
+            raise
+        model, error = None, str(exc)
+    return Settings(ollama_host=host, model=model, db_path=db_path, model_error=error)

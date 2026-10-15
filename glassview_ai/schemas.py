@@ -76,7 +76,8 @@ class AgentResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    status: str
-    model: str
+    status: str  # "ok", or "degraded" when no local model is available
+    model: str | None
+    model_error: str | None = None
     ollama_host: str
     providers: list[str] = Field(default_factory=list)

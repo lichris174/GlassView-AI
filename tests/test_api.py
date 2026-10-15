@@ -30,7 +30,8 @@ def client(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[TestClient]:
     # Import here so monkeypatched config is in effect for the lifespan.
     from glassview_ai.main import app
 
-    with TestClient(app) as c:
+    # Loopback base URL: the app rejects any other Host header (DNS rebinding).
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         yield c
     os.unlink(tmp.name)
     mem = f"{tmp.name}.memories.db"
@@ -314,3 +315,100 @@ def test_cloud_provider_without_key_is_a_400(client: TestClient) -> None:
 def test_health_advertises_providers(client: TestClient) -> None:
     providers = client.get("/health").json()["providers"]
     assert set(providers) == {"ollama", "openai", "anthropic", "deepseek"}
+
+
+# --- security: CORS allowlist + Host check -----------------------------------
+def test_cors_allows_desktop_origin(client: TestClient) -> None:
+    r = client.get("/chats", headers={"Origin": "http://tauri.localhost"})
+    assert r.headers.get("access-control-allow-origin") == "http://tauri.localhost"
+
+
+def test_cors_rejects_foreign_origin(client: TestClient) -> None:
+    """A random website must not be able to read or delete chats."""
+    r = client.get("/chats", headers={"Origin": "https://evil.example"})
+    assert "access-control-allow-origin" not in r.headers
+    preflight = client.options(
+        "/chats/x",
+        headers={
+            "Origin": "https://evil.example",
+            "Access-Control-Request-Method": "DELETE",
+        },
+    )
+    assert preflight.status_code == 400
+
+
+def test_non_loopback_host_rejected(client: TestClient) -> None:
+    """DNS rebinding: a hostile domain resolving to 127.0.0.1 keeps its Host."""
+    r = client.get("/chats", headers={"Host": "evil.example"})
+    assert r.status_code == 400
+
+
+# --- Ollama down: backend still starts, local path reports why ---------------
+def test_starts_and_degrades_without_ollama(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def down(*a, **k):  # noqa: ANN002, ANN003
+        raise config.ModelNotFoundError("Cannot reach Ollama")
+
+    monkeypatch.setattr(config, "detect_model", down)
+
+    h = client.get("/health").json()
+    assert h["status"] == "degraded" and h["model"] is None
+    assert "Cannot reach Ollama" in h["model_error"]
+
+    r = client.post("/chat", json={"chat_id": "c_down", "message": "hi"})
+    assert r.status_code == 503
+    assert "Cannot reach Ollama" in r.json()["detail"]
+    # History still works with no model.
+    assert client.get("/chats").status_code == 200
+
+
+def test_health_recovers_when_ollama_returns(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        config, "detect_model",
+        lambda *a, **k: (_ for _ in ()).throw(config.ModelNotFoundError("down")),
+    )
+    assert client.get("/health").json()["status"] == "degraded"
+    monkeypatch.setattr(config, "detect_model", lambda *a, **k: "fake-vl:test")
+    h = client.get("/health").json()
+    assert h["status"] == "ok" and h["model"] == "fake-vl:test"
+
+
+def test_load_settings_tolerates_missing_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    def down(*a, **k):  # noqa: ANN002, ANN003
+        raise config.ModelNotFoundError("down")
+
+    monkeypatch.setattr(config, "detect_model", down)
+    s = config.load_settings()
+    assert s.model is None and s.model_error == "down"
+    with pytest.raises(config.ModelNotFoundError):
+        config.load_settings(require_model=True)
+
+
+def test_aborted_stream_still_persists_turn(client: TestClient) -> None:
+    """A client abort mid-answer keeps the turn in history, marked cancelled."""
+
+
+    from glassview_ai.main import chat
+    from glassview_ai.schemas import ChatRequest
+
+    async def run() -> None:
+        resp = await chat(ChatRequest(chat_id="c_abort", message="hi"))
+        gen = resp.body_iterator
+        assert await gen.__anext__() == b"Hello"
+        await gen.aclose()  # what Starlette does when the client disconnects
+
+    # Run on the app's own event-loop thread (sqlite handles are thread-bound).
+    client.portal.call(run)
+    msgs = client.get("/chats/c_abort").json()["messages"]
+    assert [m["role"] for m in msgs] == ["user", "assistant"]
+    assert msgs[1]["content"] == "Hello\n\n[cancelled]"
+
+
+def test_bodyless_post_requires_json(client: TestClient) -> None:
+    """A cross-site simple POST (no preflight) cannot clear a chat."""
+    r = client.post("/chats/c1/clear", headers={"Content-Type": "text/plain"})
+    assert r.status_code == 415
+    assert client.post("/chats/c1/clear", json={}).status_code == 200

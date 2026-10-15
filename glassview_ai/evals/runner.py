@@ -70,7 +70,7 @@ def make_ollama_answer_fn(golden_dir: Path) -> AnswerFn:
     from .. import config
     from ..ollama_client import OllamaClient, build_messages
 
-    settings = config.load_settings()
+    settings = config.load_settings(require_model=True)
     client = OllamaClient(settings.ollama_host, settings.model)
 
     async def answer(case: EvalCase) -> str:
