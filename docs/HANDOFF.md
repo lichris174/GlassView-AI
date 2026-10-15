@@ -1,110 +1,77 @@
-# GlassView - session handoff
+# GlassView — Session Handoff
 
-State snapshot for continuing the rebuild in a fresh session.
+_Last updated: 2026-06-25. Status: Milestones A/B/C done and working, including region capture._
 
 ## What this is
+A Tauri v2 + React 18 + TS desktop overlay ("GlassView") that wraps the existing
+FastAPI + Ollama backend. A draggable bottom-right pill expands into a toolbar; tools open
+glass panels (Chat, Voice, History, Settings) above the pill. Region capture floats the
+whole window to select a screen area and ask about it.
 
-Local-first screen copilot. Hotkey -> capture screen -> a local vision model
-(Ollama qwen3-vl) reasons about it. Being rebuilt from a prototype into a
-portfolio piece that shows full-stack + applied-AI + systems engineering.
+## Layout
+- **Frontend:** `apps/desktop/`
+  - `src/` — React app (Vite). Entry `src/main.tsx` → `App.tsx`.
+  - `src-tauri/` — Rust shell (`main.rs`, `capture.rs`, `sidecar.rs`).
+- **Backend (unchanged):** repo root `glassview_ai/` — FastAPI on `http://127.0.0.1:8765`.
+  README has the endpoint table. `/chat` streams plain `text/plain` token chunks (not SSE);
+  omitting `image` reuses the chat's last image.
+- **Brief + visual reference:** `docs/files/GLASSVIEW_FRONTEND.md` + `docs/files/glassview-mockup.jsx`.
+- **Plan:** `~/.claude/plans/read-everything-in-c-users-lichr-onedriv-fuzzy-parasol.md`.
 
-Thesis: capture -> an AI that reasons about the screen, acts on it (tool use),
-and remembers it (RAG), delivered through a liquid-glass HUD overlay with voice.
-
-## Stack and layout
-
-- `apps/shell` - Tauri (Rust). Capture, region snip, global hotkey, window
-  effects, owns the Python sidecar. Split into `capture.rs`, `window_fx.rs`,
-  `sidecar.rs`, `main.rs`.
-- `apps/ui` - React + Vite + TypeScript. Chat UI, streaming, history. Glass
-  material isolated in `src/glass/` (GlassSurface + glass.css) and tokens in
-  `src/styles/tokens.css`. Browser preview in `src/preview/` (preview.html).
-- `apps/server` - FastAPI (Python). Streaming `/chat`, SQLite per-chat history,
-  Ollama client, startup model auto-detection. Venv at `apps/server/.venv`.
-
-Working branch: `rebuild/glassview`.
-
-## Run
-
-```powershell
-./setup.ps1     # one-time: npm install + python venv + deps
-./dev.ps1       # tauri dev: starts Vite + Python sidecar + native shell
+## How to run
 ```
-
-Glass material preview (browser only, cheap to iterate):
-
-```powershell
-npm --prefix apps/ui run dev
-# open http://localhost:1420/preview.html
+cd apps/desktop && npm run tauri dev    # native overlay (auto-starts backend if 8765 idle)
+# or
+cd apps/desktop && npm run dev          # browser-only at localhost:1420 (no native shell)
 ```
+Native window can't be screenshotted from the CLI env — must be run on a real desktop.
+Needs Ollama running with `qwen3-vl:8b` (already installed). `cargo build` first run is slow
+(~2 min, 195 crates); incremental ~15-45s.
 
-Prereq: Ollama running with a vision model pulled (`ollama pull qwen3-vl:8b`).
-The server auto-detects the installed tag; no env override needed.
+## Done (Milestones A/B/C)
+- **A** Pill + toolbar + theme. CSS-var theming (`styles/tokens.ts` → `--gv-*`, `useTheme`).
+  Whole G logo is a drag handle (click vs drag via threshold; native drag in Tauri).
+- **B** Chat (streaming `/chat`, `useChat` + `api/client.ts`), History (`/chats`), Settings
+  (provider auto-detect + badge, shortcut rebind), Error/health fallback (`useHealth`).
+- **C** Native shell:
+  - Content-sized transparent always-on-top window, **logo anchored bottom-left**, grows for
+    toolbar/panel via `lib/tauri.ts` `fitWindowToContent` + ResizeObserver. Anchor follows
+    user drags (`watchWindowMoves`). NOT fullscreen (avoids click-through trap).
+  - Global `Ctrl+Shift+Space` toggle, system tray (Show/Quit), sidecar auto-spawns backend
+    if 8765 idle and kills on exit.
+  - **Region capture (rebuilt safe):** runs INSIDE the main window — capture in Rust
+    (`capture_screen`), fullscreen the main window, select + crop in JS canvas
+    (`components/RegionSelect.tsx`, HiDPI-aware), open Chat with the crop. THREE escapes:
+    Rust global `Escape` failsafe (`arm/disarm_region_escape`, works even if webview frozen),
+    React Esc, Cancel button. See the memory note overlay-no-unescapable-fullscreen — do NOT
+    reintroduce a second fullscreen window.
+  - Voice (`VoicePanel`) via Web Speech API.
+  - All native calls gated by `isTauri()` so the browser build still runs.
 
-## Done
+## Known gaps / next (Milestone D + follow-ups)
+1. **Cloud providers are frontend-only.** Settings captures an OpenAI/Anthropic key and shows
+   a badge, but the **backend is Ollama-only** — those turns still run locally. To make cloud
+   real: extend `glassview_ai/schemas.py` `ChatRequest` + `routing/` + `ollama_client` to
+   dispatch by provider, and have the frontend send `provider`/`api_key` on `/chat`.
+2. **Chat context strip is a placeholder** ("No context captured") until live window-context
+   capture is wired.
+3. **Milestone D polish:** notif pulse is wired; remaining is tray polish + animation tuning.
+4. **Nothing is committed** — all work is uncommitted in the working tree on branch
+   `rebuild/glassview`. There's also stale deleted `apps/server`/`apps/shell`/old `apps/ui`
+   from the prior restructure still showing in `git status` (the new app is `apps/desktop`).
+5. `auto-launch` setting toggle is UI-only (no `tauri-plugin-autostart` wired yet).
 
-- Phase 0: monorepo restructure, removed duplicate frontends + committed chat
-  data, fixed broken model-name onboarding. Committed `ce109fc`.
-- Phase 1 core loop: FastAPI streaming + SQLite (no global session), React
-  streaming UI, Tauri owns sidecar. Verified live end to end (window + sidecar
-  + Ollama, health + chats 200). Backend tests, UI build + test, cargo check
-  all green.
-- Glass material: premium CSS frost (blur, saturate, brightness, specular,
-  grain) with tunable tokens, plus a browser preview with live tuning sliders.
-- Snip overlay rebuilt as a React Vite entry (`apps/ui/overlay.html` +
-  `src/overlay/`), replacing the old vanilla `public/overlay.html` (deleted).
-  Freeze-frame, scrim fade-in (180ms), box-shadow punch-through to full
-  brightness, tabular W x H px badge, magnifier loupe with pixel color/coords,
-  keyboard nudge (arrows) / resize (shift+arrows) / Enter confirm / Esc cancel,
-  exit "lift" animation. Browser-previewable via a synthetic frame when not in
-  Tauri (open http://localhost:1420/overlay.html under `npm run dev`). Bridge
-  helpers added to `lib/tauri.ts` (getSnipImage/finishSnip/cancelSnip). Vite
-  rollup input now includes overlay. Build + typecheck + vitest green.
+## Gotchas
+- **Overlay sizing:** the panel is out-of-flow, so the window fit re-runs on `expanded`/
+  `activeTool` changes (a plain ResizeObserver won't fire when the panel mounts). Sizes use
+  `offsetWidth/Height` (transform-independent) so the scale-in animation doesn't mis-measure.
+- **HiDPI:** test machine is scale=2 (1280×800 logical / 2560×1600 physical). Region crop
+  scales CSS px → physical via `naturalWidth/innerWidth`.
+- **Region safety is non-negotiable** — keep the Rust global-Esc failsafe; never ship a
+  fullscreen/always-on-top window that can render blank without an OS-level escape.
+- `screenshots` crate v0.7 verified working on this PC (`src-tauri/examples/captest.rs`).
 
-## Open / next
-
-1. Snip overlay: runtime-verify under Tauri (`./dev.ps1`) - drag, loupe color
-   sampling, keyboard adjust, lift exit, crop accuracy. Then multi-monitor:
-   Rust still captures the primary screen (`Screen::from_point(0,0)`); make it
-   capture the monitor under the cursor and place the overlay window there.
-2. Apple liquid glass (real lensing/refraction): WebGL shader sampling a
-   backdrop texture; HUD overlay feeds the screen capture as that texture.
-   Swap happens inside `src/glass/` only.
-3. Applied-AI spine: DONE as standalone, offline-tested modules (30 server
-   tests, ruff green). Still UNWIRED into the `/chat` route and the UI.
-   - `glassview_ai/evals/` - scorer + `run_eval` + live Ollama runner, golden
-     set at `evals/golden/cases.json`, `make eval` target.
-   - `glassview_ai/privacy/` - `redact()` masks secrets/PII (used by RAG add).
-   - `glassview_ai/routing/` - `route()` fast vs strong model by prompt/image.
-   - `glassview_ai/agents/` - bounded tool-use loop + `ToolRegistry` (tools are
-     stubs/injectable; real clipboard/crop tools need Tauri wiring).
-   - `glassview_ai/rag/` - sqlite-vec `MemoryStore` + pluggable embedder
-     (offline `HashEmbedder`, `OllamaEmbedder` for quality).
-   - `glassview_ai/ocr/` - Tesseract extract (graceful if binary absent; not
-     installed here) + `fuse_prompt`.
-   Next: wire spine into `/chat` (OCR fuse -> route -> optional agent loop ->
-   persist+redact into RAG), expose `/recall`, add real agent tools via Tauri,
-   and add image golden cases (Pillow now installed, can synthesize fixtures).
-4. Done: the `POST /chat` empty-body bug. Two causes. (a) `config` bound
-   `DB_PATH`/`OLLAMA_HOST` from env at import time, so the launcher's and the
-   tests' `GLASSVIEW_DB` override was ignored; `load_settings`/`detect_model`
-   now read env at call time, and the test suite is properly isolated (was
-   silently appending to a real `glassview.db`). (b) an Ollama error raised
-   mid-stream after the 200 header reached the client as a silent empty body;
-   `event_stream` now catches it, emits `[error] ...` into the stream, and
-   persists the failed turn. A regression test covers the error path. Next live
-   run will show the real Ollama error string if one occurs.
-
-Build order preference: finish the UI (glass + snip) before wiring AI.
-
-## Conventions (important)
-
-- No AI tells in committed code/docs: no em dashes, en dashes, unicode ellipsis,
-  smart quotes, emojis, or giveaway phrasing. Plain ASCII punctuation.
-- Commits do NOT include a Co-Authored-By Claude trailer (must not look AI made).
-- Keep the design/UI layer swappable: components consume tokens, glass lives
-  behind one module, logic decoupled from presentation.
-- Work autonomously through mechanical steps; pause only at subjective UI/visual
-  design choices.
-
-Full plan: `C:\Users\lichr\.claude\plans\temporal-sparking-bengio.md` (private).
+## Verify quickly
+- Chat: open Chat, send a message, watch tokens stream; reopen History → chat saved.
+- Region: Region tool → drag a box → Chat opens with the capture; press Esc anytime to bail.
+- Health: stop Ollama → ErrorPanel within ~10s; restart → clears.
