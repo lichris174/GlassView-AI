@@ -2,7 +2,7 @@
 # the underlying commands directly (see each recipe).
 PY := .venv/Scripts/python.exe
 
-.PHONY: test lint eval split verify-split
+.PHONY: test lint eval split verify-split baselines
 
 test:
 	$(PY) -m pytest -q
@@ -21,3 +21,10 @@ split:
 # Fails if any frozen test frame was added, removed, or modified.
 verify-split:
 	$(PY) -m ml.splits verify
+
+# Baselines on a split (default val). Each run writes results/<stamp>-<system>-<split>/.
+SPLIT ?= val
+baselines:
+	$(PY) -m ml.evaluate run --system block_all --split $(SPLIT)
+	$(PY) -m ml.evaluate run --system ocr_regex --split $(SPLIT)
+	$(PY) -m ml.evaluate run --system qwen_vl --split $(SPLIT)

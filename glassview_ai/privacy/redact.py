@@ -84,6 +84,19 @@ def scan(text: str) -> list[Finding]:
     return findings
 
 
+def find_spans(text: str) -> list[tuple[str, int, int]]:
+    """(kind, start, end) character spans of every finding, for mapping matches
+    back to on-screen positions (used by the OCR baseline in ml/baselines)."""
+    spans: list[tuple[str, int, int]] = []
+    for kind, pattern, validator in _RULES:
+        for m in pattern.finditer(text):
+            group = "v" if m.groupdict().get("v") else 0
+            if validator and not validator(m.group(group)):
+                continue
+            spans.append((kind, m.start(group), m.end(group)))
+    return spans
+
+
 def redact(text: str) -> tuple[str, list[Finding]]:
     """Replace detected secrets / PII with ``[REDACTED:KIND]`` markers.
 
