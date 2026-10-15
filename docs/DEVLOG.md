@@ -161,3 +161,44 @@ findings:
   in-flight request ref.
 
 **Results:** `pytest` 72 passed, `ruff` clean, `tsc` clean.
+
+---
+
+## 2026-10-14 — Phase 1: data pipeline
+
+Built the tooling for collecting and splitting the dataset before collecting any data, so the rules
+that make the numbers honest are enforced by code rather than remembered.
+
+### Capture (`ml/capture.py`)
+- Grabs the primary monitor every few seconds during a named session.
+- **Skips near-duplicates** using a 64-bit difference hash (dHash): a tiny grayscale thumbnail
+  where each bit records whether a pixel is brighter than its neighbour. A blinking cursor flips a
+  few bits; a new screen flips many. Frames under 6 bits from the last saved one are dropped, so
+  idle time does not flood the dataset with copies that would make it look bigger than it is.
+- Records the foreground app and window title per frame (Windows API via `ctypes`, no extra
+  dependency), for summarizing the dataset by app later.
+- **Saves outside the repo and outside OneDrive** (`%LOCALAPPDATA%\GlassView\dataset`). Even fake
+  sensitive data should not be synced or committable by accident.
+
+### Splits (`ml/splits.py`)
+- **Splits by session, not by frame.** Frames within a session are near-copies. A per-frame random
+  split would put almost-identical screens in train and test, and test scores would measure
+  memorization instead of generalization. This is the single most common way small vision datasets
+  overstate results.
+- **Freezes the test set.** `splits.json` stores a SHA-256 of every test frame plus one hash over
+  the whole set. New sessions captured later go to train only. `make verify-split` fails if any
+  test frame is added, removed, or edited.
+- Deterministic (fixed seed) and refuses to freeze with fewer than 5 sessions.
+
+### Labeling guide (`docs/LABELING_GUIDE.md`)
+Five classes (`credential`, `api_key`, `financial`, `private_message`, `personal_id`), with what to
+box and what not to box for each, edge cases decided once (masked values *are* boxed; unreadable
+text is not), a collection plan by session theme, and a target of ~300 frames from 15+ sessions with
+about a third containing nothing sensitive. Those empty frames are how the false-blur rate gets
+measured.
+
+**Verified:** 81 tests pass (9 new: hashing, session validation, split determinism, sessions never
+straddling splits, frozen test set, tamper detection). Smoke-tested both CLIs on a real 2560×1600
+capture, then deleted the frames.
+
+**Next (manual):** capture sessions per the collection plan, review, freeze the split, label.
