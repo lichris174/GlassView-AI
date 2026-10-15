@@ -15,19 +15,29 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from . import config
+from .agents import run_agent
+from .agents.tools import build_registry
 from .db import ChatStore
 from .ocr import extract as ocr_extract
 from .ocr import fuse_prompt
 from .ollama_client import OllamaClient, build_messages
-from .rag import HashEmbedder, MemoryStore
+from .providers import PROVIDERS, MissingApiKeyError, build_client
+from .rag import HashEmbedder, MemoryStore, fuse_recall, select_hits
 from .routing import RoutePolicy, route
 from .schemas import (
+    AgentRequest,
+    AgentResponse,
+    AgentStepOut,
     ChatRequest,
     ChatSummary,
     HealthResponse,
     NewChatRequest,
     RenameRequest,
 )
+
+# How many raw memory hits to pull before filtering; select_hits trims to the few
+# that clear the distance cut and are not from the current chat.
+RECALL_CANDIDATES = 10
 
 # Resolved at startup in the lifespan; kept on app.state for testability.
 
@@ -48,6 +58,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.memory = MemoryStore(
         path=f"{settings.db_path}.memories.db", embedder=HashEmbedder()
     )
+    # Tools the agent loop may call. Read-only and local; see agents/tools.py.
+    app.state.tools = build_registry(app.state.memory, store)
     try:
         yield
     finally:
@@ -71,7 +83,9 @@ def _store(app: FastAPI) -> ChatStore:
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     s = app.state.settings
-    return HealthResponse(status="ok", model=s.model, ollama_host=s.ollama_host)
+    return HealthResponse(
+        status="ok", model=s.model, ollama_host=s.ollama_host, providers=list(PROVIDERS)
+    )
 
 
 # --- chat CRUD ---------------------------------------------------------------
@@ -149,15 +163,49 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             ocr = ocr_extract(raw)
             prompt = fuse_prompt(req.message, ocr.text)
 
+    # Recall fusion: fold in relevant notes from *other* chats. This chat's own
+    # turns are already replayed as history, so they are excluded to avoid both
+    # wasted context and the model parroting its previous answer back.
+    if req.recall and req.message.strip():
+        hits = select_hits(
+            memory.query(req.message, k=RECALL_CANDIDATES),
+            req.message,
+            exclude_chat_id=req.chat_id,
+        )
+        prompt = fuse_recall(prompt, hits)
+
     # Route to a model tier based on the prompt and whether an image is present.
+    # Routing only governs the local path: a cloud provider is a single model the
+    # user chose explicitly, so there is no tier to escalate to.
     decision = route(req.message, has_image=bool(image), policy=app.state.policy)
-    # Reuse the lifespan client when routing lands on the default model;
-    # only spin up a different client if routing ever picks another tag.
-    ollama = (
-        app.state.ollama
-        if decision.model == app.state.settings.model
-        else OllamaClient(app.state.settings.ollama_host, decision.model)
-    )
+    settings = app.state.settings
+
+    if req.provider in ("openai", "anthropic", "deepseek") or req.api_key:
+        try:
+            client = build_client(
+                req.provider,
+                api_key=req.api_key,
+                model=req.model,
+                ollama_host=settings.ollama_host,
+                ollama_model=settings.model,
+            )
+        except MissingApiKeyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ImportError as exc:  # provider SDK not installed
+            raise HTTPException(
+                status_code=501,
+                detail=f"Provider unavailable: {exc}",
+            ) from exc
+        chosen_model = client.model
+    else:
+        # Reuse the lifespan client when routing lands on the default model;
+        # only spin up a different client if routing ever picks another tag.
+        client = (
+            app.state.ollama
+            if decision.model == settings.model
+            else OllamaClient(settings.ollama_host, decision.model)
+        )
+        chosen_model = decision.model
 
     messages = build_messages(config.SYSTEM_PROMPT, history, prompt, image)
 
@@ -165,7 +213,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         answer_parts: list[str] = []
         error: str | None = None
         try:
-            async for chunk in ollama.stream_chat(messages):
+            async for chunk in client.stream_chat(messages):
                 answer_parts.append(chunk)
                 yield chunk.encode("utf-8")
         except Exception as exc:  # noqa: BLE001
@@ -189,13 +237,53 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             if error is None and answer_parts:
                 memory.add(
                     f"Q: {req.message}\nA: {answer}",
-                    meta={"chat_id": req.chat_id, "model": decision.model},
+                    meta={"chat_id": req.chat_id, "model": chosen_model},
+                    redact_text=req.redact,
                 )
 
     return StreamingResponse(
         event_stream(),
         media_type="text/plain; charset=utf-8",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# --- agent (bounded tool use) ------------------------------------------------
+@app.post("/agent", response_model=AgentResponse)
+async def agent(req: AgentRequest) -> AgentResponse:
+    """Answer a question through the bounded tool-use loop.
+
+    Deliberately separate from ``/chat``: the loop is multi-turn and blocking
+    (it cannot stream a token at a time), and an ordinary chat turn should not
+    pay for tool round-trips it does not need.
+    """
+    registry = app.state.tools
+    ollama: OllamaClient = app.state.ollama
+
+    async def complete(transcript: list[dict[str, str]]) -> str:
+        return "".join([chunk async for chunk in ollama.stream_chat(transcript)])
+
+    try:
+        result = await run_agent(
+            req.question,
+            complete,
+            registry,
+            system_prompt=config.SYSTEM_PROMPT,
+            max_steps=req.max_steps,
+        )
+    except Exception as exc:  # noqa: BLE001 - upstream model failure, not a bug here
+        # /chat surfaces model failures inline in its stream; this path has no
+        # stream to write into, so report it as a bad gateway with the reason
+        # (model not pulled, out of memory, daemon down) instead of a 500.
+        raise HTTPException(status_code=502, detail=f"Model call failed: {exc}") from exc
+    return AgentResponse(
+        answer=result.answer,
+        steps=[
+            AgentStepOut(tool=st.tool, args=st.args, observation=st.observation)
+            for st in result.steps
+        ],
+        stopped_reason=result.stopped_reason,
+        tools=registry.names(),
     )
 
 

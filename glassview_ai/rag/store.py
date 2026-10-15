@@ -58,9 +58,14 @@ class MemoryStore:
         )
         self.db.commit()
 
-    def add(self, text: str, meta: dict | None = None) -> int:
-        """Redact, embed, and store a memory. Returns its rowid."""
-        clean, _findings = redact(text)
+    def add(self, text: str, meta: dict | None = None, *, redact_text: bool = True) -> int:
+        """Redact, embed, and store a memory. Returns its rowid.
+
+        ``redact_text=False`` stores the text verbatim. That is a deliberate
+        downgrade the user opts into (Settings -> Privacy redaction); it stays
+        on by default so the guard is never lost by omission.
+        """
+        clean = redact(text)[0] if redact_text else text
         cur = self.db.execute(
             "INSERT INTO memories (text, meta, created_at) VALUES (?,?,?)",
             (clean, json.dumps(meta or {}), time.time()),

@@ -11,8 +11,8 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# cases.py -> evals -> glassview_ai -> server -> apps -> <repo root>
-DEFAULT_GOLDEN = Path(__file__).resolve().parents[4] / "evals" / "golden"
+# cases.py -> evals -> glassview_ai -> <repo root>
+DEFAULT_GOLDEN = Path(__file__).resolve().parents[2] / "evals" / "golden"
 
 
 @dataclass(frozen=True)

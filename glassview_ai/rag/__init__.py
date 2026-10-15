@@ -7,6 +7,15 @@ reproducible), while an Ollama-backed embedder can be swapped in for quality.
 """
 
 from .embed import Embedder, HashEmbedder, OllamaEmbedder
+from .fuse import fuse_recall, select_hits
 from .store import MemoryHit, MemoryStore
 
-__all__ = ["Embedder", "HashEmbedder", "OllamaEmbedder", "MemoryHit", "MemoryStore"]
+__all__ = [
+    "Embedder",
+    "HashEmbedder",
+    "OllamaEmbedder",
+    "MemoryHit",
+    "MemoryStore",
+    "fuse_recall",
+    "select_hits",
+]
