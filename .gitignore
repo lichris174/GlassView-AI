@@ -2,23 +2,26 @@
 node_modules/
 
 # Rust / Tauri build artifacts
-apps/shell/target/
-apps/shell/gen/schemas/
+target/
+apps/desktop/src-tauri/gen/schemas/
+
+# Frontend build
+apps/desktop/dist/
 
 # Python
-apps/server/.venv/
+.venv/
 __pycache__/
 *.pyc
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 
-# Local data (chat history DB)
-apps/server/glassview.db
+# Local data (chat history + memory DBs)
 *.db
 
-# Frontend build
-apps/ui/dist/
+# Local screenshots / tool output (never commit captured screens)
+/*.png
+.playwright-mcp/
 
 # Editor / OS
 .DS_Store
