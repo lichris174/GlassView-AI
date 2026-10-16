@@ -172,11 +172,24 @@ def test_import_matches_label_studio_renamed_files(tmp_path: Path) -> None:
     assert problems == ["zz-unknown.txt: no frame match"]
 
 
-def test_import_rejects_reordered_classes(tmp_path: Path) -> None:
-    (tmp_path / "labels").mkdir()
-    (tmp_path / "classes.txt").write_text(
-        "api_key\ncredential\nfinancial\nprivate_message\npersonal_id\n"
+def test_import_remaps_class_ids_by_name(tmp_path: Path) -> None:
+    raw, export, dest = tmp_path / "raw", tmp_path / "export", tmp_path / "labels"
+    (raw / "s").mkdir(parents=True)
+    Image.new("RGB", (10, 10)).save(raw / "s" / "f1.png")
+    (export / "labels").mkdir(parents=True)
+    # Alphabetical order, as Label Studio may export: id 0 is api_key here.
+    (export / "classes.txt").write_text(
+        "api_key\ncredential\nfinancial\npersonal_id\nprivate_message\n"
     )
+    (export / "labels" / "x-f1.txt").write_text("0 0.5 0.5 0.2 0.2\n4 0.1 0.1 0.1 0.1\n")
+    import_yolo_export(export, raw, dest)
+    ids = [line.split()[0] for line in (dest / "s" / "f1.txt").read_text().splitlines()]
+    assert ids == ["1", "3"]  # api_key and private_message in CLASSES order
+
+
+def test_import_rejects_unknown_class(tmp_path: Path) -> None:
+    (tmp_path / "labels").mkdir()
+    (tmp_path / "classes.txt").write_text("face\n")
     with pytest.raises(SystemExit):
         import_yolo_export(tmp_path, tmp_path, tmp_path / "out")
 

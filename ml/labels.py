@@ -12,7 +12,6 @@ false-blur rate be measured.
 from __future__ import annotations
 
 import argparse
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -95,19 +94,17 @@ def import_yolo_export(export_dir: Path, raw: Path, dest: Path) -> tuple[int, li
 
     Label Studio renames uploads to ``<random>-<original name>``, so each label
     is matched to a raw frame by its original file name. Returns (imported,
-    problems). The export's classes.txt must match CLASSES exactly, or class
-    ids would silently mean different things.
+    problems). Class ids are remapped by NAME using the export's classes.txt,
+    since Label Studio may number classes in a different order than CLASSES.
     """
+    remap = {i: i for i in range(len(CLASSES))}
     classes_txt = export_dir / "classes.txt"
     if classes_txt.exists():
-        exported = tuple(c.strip() for c in classes_txt.read_text().splitlines() if c.strip())
-        if tuple(sorted(exported)) != tuple(sorted(CLASSES)):
-            raise SystemExit(f"classes.txt {exported} does not match {CLASSES}")
-        if exported != CLASSES:
-            raise SystemExit(
-                f"classes.txt order {exported} differs from {CLASSES}; "
-                "reorder the labels in Label Studio's config before exporting"
-            )
+        exported = [c.strip() for c in classes_txt.read_text().splitlines() if c.strip()]
+        unknown = set(exported) - set(CLASSES)
+        if unknown:
+            raise SystemExit(f"Export has classes not in {CLASSES}: {sorted(unknown)}")
+        remap = {i: CLASSES.index(name) for i, name in enumerate(exported)}
 
     frames = sorted(raw.glob("*/*.png"))
     imported, problems = 0, []
@@ -119,7 +116,12 @@ def import_yolo_export(export_dir: Path, raw: Path, dest: Path) -> tuple[int, li
         frame = match[0]
         target = dest / frame.parent.name / f"{frame.stem}.txt"
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(txt, target)
+        lines = []
+        for line in txt.read_text(encoding="utf-8").splitlines():
+            parts = line.split()
+            if parts:
+                lines.append(" ".join([str(remap[int(parts[0])]), *parts[1:]]))
+        target.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
         imported += 1
 
     # An exported image with no label file was labeled "nothing sensitive".
