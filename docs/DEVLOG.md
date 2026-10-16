@@ -275,3 +275,31 @@ resolved); the live call failed with Ollama's "model requires more system memory
 available (2.6 GiB)". That is free RAM at the time, not a code problem: close memory-heavy apps
 before running `make baselines`. Grounding DINO / OWLv2 is deferred to Phase 3, which sets up the
 PyTorch environment anyway.
+
+---
+
+## 2026-10-15 — Making training data cheap: synthetic screens
+
+Hand-labeling thousands of screenshots is the slowest part of any detector project, so training
+data is now **generated with labels for free** (`ml/synth/`):
+
+- Fake app screens (chat, email, bank, login, password vault, `.env` editor, terminal, checkout,
+  profile) and harmless ones (docs, dashboards, news, code, shop) are built as HTML with fabricated
+  content (Faker plus invented brand names, so nothing imitates a real company).
+- Each sensitive element is tagged `data-s="<class>"`. Headless Chromium renders the page, and a
+  script reads every tagged element's on-screen rectangle, **clipped by each overflow-hidden
+  ancestor and the viewport**, so labels match exactly what is visible.
+- Every screen randomizes theme (light/dark, hue, accent, font, size), window size (720p to
+  1440p), zoom (100/125/150%), browser bar, taskbar, and 30% are two apps tiled side by side.
+- Tagging follows the labeling guide, including deliberate **hard negatives**: empty `API_KEY=`
+  lines, `os.environ["API_KEY"]`, empty login forms, prices, generic KPI tiles.
+- A preview contact sheet draws boxes for eyeballing. That caught one bug: terminal screens laid
+  text out as columns (a `<pre>` acting as a flex container), which would have trained the model on
+  garbage boxes.
+
+**Synthetic is train-only.** Val and test are real screenshots of real apps showing fake content
+from a generated kit (`ml/synth/kit.py`; checklist in `docs/COLLECTING.md`). This keeps the
+reported numbers about transfer to real screens, and sets up a clean ablation later: synthetic
+only vs. synthetic + a little real.
+
+Label import now remaps class ids by name, since Label Studio may number classes differently.
