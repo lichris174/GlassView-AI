@@ -107,14 +107,19 @@ GEOMETRY_JS = """
 @pytest.fixture(scope="module")
 def page():  # noqa: ANN201
     sync_api = pytest.importorskip("playwright.sync_api")
+    # sync_playwright runs its own event loop; it must be stopped on every path
+    # or later async tests fail with "This event loop is already running".
+    pw = sync_api.sync_playwright().start()
     try:
-        pw = sync_api.sync_playwright().start()
         browser = pw.chromium.launch()
     except Exception as e:  # noqa: BLE001 - any launch failure means "no browser here"
+        pw.stop()
         pytest.skip(f"Chromium unavailable: {e}")
-    pg = browser.new_page(viewport={"width": 1366, "height": 768})
-    yield pg
-    browser.close()
+    try:
+        yield browser.new_page(viewport={"width": 1366, "height": 768})
+    finally:
+        browser.close()
+        pw.stop()
     pw.stop()
 
 
