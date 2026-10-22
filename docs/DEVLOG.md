@@ -303,3 +303,62 @@ reported numbers about transfer to real screens, and sets up a clean ablation la
 only vs. synthetic + a little real.
 
 Label import now remaps class ids by name, since Label Studio may number classes differently.
+
+## 2026-10-20 — Real screenshots captured, split frozen
+
+108 real frames in 9 sessions. 94 were captured by an unattended driver: it opened real apps
+(VS Code, Notepad, Windows Terminal, Excel, Chromium on live sign-in, checkout and news pages)
+with fake kit content, typed with SendInput or Playwright, never submitted a form, and stopped
+whenever the mouse moved. The other 14 were captured by hand. Report these as "automated capture
+in real apps", not organic use.
+
+- **Discarded run.** On first launch, a Windows Firewall prompt for the automated browser sat
+  over 38 frames. Those frames were deleted before any split or label existed.
+- **Manual review.** Every frame was reviewed, including a dedicated pass over the
+  notification-toast corner. No real content was found. The Windows username shows up in file
+  paths; it is not a secret and was left in.
+- **Split re-frozen.** The first freeze (seed 0) left val with only api_key and clean sessions,
+  so per-class thresholds could not be tuned. With no labels or results in existence yet, the
+  split was redrawn using a rule fixed in advance: take the first seed whose val and test each
+  cover all four classes the sessions were designed to produce (credential, api_key, financial,
+  personal_id). That rule picked **seed 5**:
+  - train: mixed-split (10 frames)
+  - val: vscode, terminal, notepad (35 frames)
+  - test: forms, login, excel, clean, devkeys-vscode (63 frames)
+- **Gap: no real private_message frames.** Real chat sessions were skipped because they would
+  capture the owner's real chat accounts. For private_message, real-screen recall cannot be
+  measured, and synthetic results stand in for it. The report must say so.
+
+## 2026-10-21 — Labels imported and audited
+
+The owner labeled all 108 frames in Label Studio. `ml.labels import <export>.json` now reads
+Label Studio's JSON export directly: no image download, and skipped tasks stay unlabeled instead of
+counting as clean.
+
+An overlay audit before any model ran found two systematic errors in the forms and Excel frames:
+wrong classes (contact fields and the Excel transaction table labeled `credential`) and boxes on
+empty fields (grey placeholders such as `you@example.com`, `Choose...` dropdowns, and the
+w3schools sample values). The assistant made the fixes by hand, box by box, against the labeling
+guide; the owner reviews them.
+- 32 boxes deleted: empty fields and placeholders, and HTML source that only showed sample
+  placeholder text.
+- 24 boxes relabeled `credential` → `personal_id`: typed name, email, address, zip.
+- 5 boxes relabeled → `financial`: the Excel table, plus a card/IBAN block that had been labeled
+  `personal_id`.
+- 5 frames the owner skipped were filled in. Two clean frames (a doc and a terminal) got empty
+  labels. Three frames, where the VS Code theme menu overlays the editor, copied the box from the
+  identical neighbouring frame; the overlay does not cover the boxed text.
+
+Final boxes:
+
+| Class | Boxes |
+|---|---|
+| api_key | 46 |
+| financial | 27 |
+| personal_id | 29 |
+| credential | 14 |
+| private_message | 0 |
+
+39 of 108 frames are clean. These corrections live in the label files, so the Label Studio project is
+now stale; re-importing from it would undo them. Test-set hash unchanged (labels are hashed
+separately).

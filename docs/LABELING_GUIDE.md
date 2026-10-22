@@ -83,3 +83,9 @@ model is trained.
 ## Change log
 
 - 2026-10-14: initial version.
+- 2026-10-20 (before any labeling): three edge cases settled.
+  - **Login fields:** filled username/email *and* password fields on a sign-in form are both
+    `credential`, one box per field.
+  - **Contact details:** a person's full name, phone, email, or home address entered in a form
+    or document is `personal_id`.
+  - **OS username in file paths** (e.g. `C:\Users\<name>`): not boxed.
