@@ -122,30 +122,42 @@ export default function App() {
   // Launch-on-login: the OS registration is the source of truth, so adopt it on
   // startup rather than trusting the stored setting (the user may have changed it
   // elsewhere, or the registration may have failed last time).
+  // `osAutoLaunch` is the value last known to be registered with the OS; null until
+  // the startup read settles, so nothing is written before the OS has been asked.
+  const osAutoLaunch = useRef<boolean | null>(null);
   useEffect(() => {
     if (!TAURI) return;
+    const stored = settings.autoLaunch;
     isAutostartEnabled()
-      .then((on) => update("autoLaunch", on))
-      .catch((err) => console.error("[autostart] read failed:", err));
+      .then((on) => {
+        osAutoLaunch.current = on;
+        update("autoLaunch", on);
+      })
+      .catch((err) => {
+        // Unknown OS state: assume the stored value holds and write only on a change.
+        osAutoLaunch.current = stored;
+        console.error("[autostart] read failed:", err);
+      });
     // Intentionally mount-only: this seeds the setting from the OS.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Apply changes to launch-on-login. Skipped until the initial read above has
-  // settled, so seeding the value cannot immediately re-write it.
-  const autoLaunchSynced = useRef(false);
+  // Apply user changes to launch-on-login. Only writes when the setting differs from
+  // what the OS already has, so seeding (and StrictMode's re-run) never re-writes it.
   useEffect(() => {
     if (!TAURI) return;
-    if (!autoLaunchSynced.current) {
-      autoLaunchSynced.current = true;
-      return;
-    }
-    setAutostart(settings.autoLaunch).catch((err) =>
-      console.error("[autostart] write failed:", err),
-    );
+    const want = settings.autoLaunch;
+    if (osAutoLaunch.current === null || osAutoLaunch.current === want) return;
+    osAutoLaunch.current = want;
+    setAutostart(want).catch((err) => {
+      osAutoLaunch.current = !want;
+      console.error("[autostart] write failed:", err);
+    });
   }, [settings.autoLaunch]);
 
-  // Rebind the global shortcut when it changes (native only).
+  // Bind the stored shortcut on launch (native only). Settings validates and
+  // registers a new one before saving it, so a later change here is already bound
+  // and the Rust side treats the repeat as a no-op.
   useEffect(() => {
     if (TAURI) {
       registerShortcut(settings.shortcut).catch((err) => {

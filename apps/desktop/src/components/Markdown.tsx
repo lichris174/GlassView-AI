@@ -6,6 +6,12 @@ import rehypeKatex from "rehype-katex";
 // KaTeX stylesheet — Vite bundles its woff2 fonts locally, so math typesets offline in
 // the Tauri shell (no CDN). See plan: KaTeX offline note.
 import "katex/dist/katex.min.css";
+import { openExternal } from "../lib/tauri";
+
+/** Only web links leave the app; anything else (relative, mailto:, …) is inert. */
+function isWebLink(href: string | undefined): href is string {
+  return !!href && /^https?:\/\//i.test(href);
+}
 
 /**
  * Renders assistant / streaming chat text as GitHub-flavoured Markdown with LaTeX math
@@ -20,9 +26,21 @@ export const Markdown = memo(function Markdown({ text }: { text: string }) {
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[rehypeKatex]}
         components={{
-          // Open links in the system browser, never navigate the overlay webview.
+          // Never navigate the overlay webview: web links are handed to the system
+          // browser, everything else is swallowed.
           a: ({ node: _node, ...props }) => (
-            <a {...props} target="_blank" rel="noreferrer noopener" />
+            <a
+              {...props}
+              rel="noreferrer noopener"
+              onClick={(e) => {
+                e.preventDefault();
+                if (isWebLink(props.href)) {
+                  openExternal(props.href).catch((err) =>
+                    console.error("[link] failed to open:", err),
+                  );
+                }
+              }}
+            />
           ),
         }}
       >

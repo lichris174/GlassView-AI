@@ -2,24 +2,59 @@
 //! kill on exit. Best-effort — if no venv python is found we log and continue so a
 //! developer can run `./dev.ps1` manually.
 
+use std::io::{Read, Write};
 use std::net::TcpStream;
+#[cfg(all(windows, not(debug_assertions)))]
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
 static SIDECAR: Mutex<Option<Child>> = Mutex::new(None);
+/// Set by stop(). start() runs on its own thread, so an app that quits while it is
+/// still probing must not go on to spawn a backend nobody will kill.
+static STOPPED: AtomicBool = AtomicBool::new(false);
 
 const PORT: &str = "8765";
 
-/// True if something already answers on 127.0.0.1:8765 (a dev backend, say).
+/// Upper bound on a /health reply. The route probes Ollama (5 s timeout), so a live
+/// backend with a hung daemon can take that long to answer.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Keeps the spawned python.exe (a console program) from opening a console window
+/// in release builds, where the shell itself has no console to share. Debug builds
+/// keep sharing the terminal so backend logs stay visible.
+#[cfg(all(windows, not(debug_assertions)))]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// True if a GlassView backend already answers on 127.0.0.1:8765 (a dev backend, say).
+/// Checks /health for the backend's own fields rather than a bare TCP connect, so an
+/// unrelated or wedged listener on the port is not mistaken for a working backend.
 fn backend_running() -> bool {
-    TcpStream::connect_timeout(
+    let Ok(mut stream) = TcpStream::connect_timeout(
         &"127.0.0.1:8765".parse().unwrap(),
         Duration::from_millis(250),
-    )
-    .is_ok()
+    ) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(HEALTH_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let request =
+        format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    let reply = String::from_utf8_lossy(&raw);
+    let status_ok = reply
+        .lines()
+        .next()
+        .is_some_and(|status| status.split_whitespace().nth(1) == Some("200"));
+    status_ok && reply.contains("\"ollama_host\"") && reply.contains("\"providers\"")
 }
 
 /// Repo root relative to the src-tauri working dir during `tauri dev`
@@ -44,11 +79,14 @@ fn python_candidates(root: &PathBuf) -> Vec<PathBuf> {
 /// Start the FastAPI service as a child process if not already running.
 pub fn start() {
     let mut guard = SIDECAR.lock().unwrap();
-    if guard.is_some() {
+    if guard.is_some() || STOPPED.load(Ordering::SeqCst) {
         return;
     }
     if backend_running() {
         println!("[sidecar] backend already serving on {PORT}; not spawning");
+        return;
+    }
+    if STOPPED.load(Ordering::SeqCst) {
         return;
     }
 
@@ -62,7 +100,10 @@ pub fn start() {
         return;
     };
 
-    match Command::new(&python)
+    let mut command = Command::new(&python);
+    #[cfg(all(windows, not(debug_assertions)))]
+    command.creation_flags(CREATE_NO_WINDOW);
+    match command
         .current_dir(&root)
         .args([
             "-m",
@@ -113,6 +154,7 @@ fn watch_readiness() {
 
 /// Kill the backend child if we started one.
 pub fn stop() {
+    STOPPED.store(true, Ordering::SeqCst);
     if let Some(mut child) = SIDECAR.lock().unwrap().take() {
         let _ = child.kill();
         let _ = child.wait();

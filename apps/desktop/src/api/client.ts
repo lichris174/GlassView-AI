@@ -33,13 +33,6 @@ export interface ChatDetail {
   messages: ApiMessage[];
 }
 
-export interface RecallHit {
-  text: string;
-  distance: number;
-  meta: Record<string, unknown>;
-  created_at: string;
-}
-
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json() as Promise<T>;
@@ -66,11 +59,6 @@ export const api = {
       json<{ ok: boolean }>(r),
     ),
 
-  recall: (q: string, k = 5) =>
-    fetch(`${BASE_URL}/recall?q=${encodeURIComponent(q)}&k=${k}`).then((r) =>
-      json<{ hits: RecallHit[] }>(r),
-    ),
-
   /**
    * Stream a turn. Yields decoded token chunks as they arrive. `image` is sent only
    * when a fresh capture/attachment exists — otherwise the backend reuses the chat's
@@ -82,12 +70,21 @@ export const api = {
    *
    * `signal` aborts the HTTP request itself, so a cancelled turn stops streaming
    * instead of running to completion in the background.
+   *
+   * `onAccepted` fires once the backend answers 2xx. From then on it persists the
+   * turn, so a failure after this point is not a rejected request.
    */
   async *chat(
     chatId: string,
     message: string,
     image?: string,
-    opts: { redact?: boolean; provider?: string; apiKey?: string; signal?: AbortSignal } = {},
+    opts: {
+      redact?: boolean;
+      provider?: string;
+      apiKey?: string;
+      signal?: AbortSignal;
+      onAccepted?: () => void;
+    } = {},
   ): AsyncGenerator<string> {
     const res = await fetch(`${BASE_URL}/chat`, {
       method: "POST",
@@ -98,11 +95,13 @@ export const api = {
         message,
         image: image ?? null,
         redact: opts.redact ?? true,
-        // Omitted entirely for local Ollama so the backend keeps its default path.
+        // Always the Settings choice ("ollama" for local). null only if unset, in
+        // which case the backend guesses the provider from the key.
         provider: opts.provider ?? null,
         api_key: opts.apiKey || null,
       }),
     });
+    if (res.ok) opts.onAccepted?.();
     if (!res.ok || !res.body) {
       // FastAPI errors carry a human-readable `detail` (e.g. "Cannot reach Ollama").
       const detail = await res.json().then((b) => b?.detail, () => null);

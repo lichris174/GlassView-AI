@@ -89,10 +89,22 @@ export function useChat(options: UseChatOptions = {}) {
       setThinking(true);
       setStreamText("");
 
+      // A chat created for this turn stays empty unless the backend accepts /chat
+      // (a 2xx answer means it persists the turn). If /chat is rejected or never
+      // reached, the chat is deleted again so History gets no blank "New chat".
+      const createdHere = chatId === null;
+      let id: string | null = null;
+      let accepted = false;
       try {
-        const id = await ensureChat();
+        id = await ensureChat();
         let acc = "";
-        const opts = { redact, provider, apiKey, signal: ctrl.signal };
+        const opts = {
+          redact,
+          provider,
+          apiKey,
+          signal: ctrl.signal,
+          onAccepted: () => { accepted = true; },
+        };
         for await (const chunk of api.chat(id, msg, image, opts)) {
           if (!isCurrent()) return;
           acc += chunk;
@@ -110,6 +122,10 @@ export function useChat(options: UseChatOptions = {}) {
       } catch (e) {
         // An abort is a deliberate cancel, not an error to show the user.
         if (!isCurrent() || ctrl.signal.aborted) return;
+        if (createdHere && id && !accepted) {
+          api.deleteChat(id).catch(() => {});
+          setChatId(null);
+        }
         setMessages((m) => [
           ...m,
           { role: "assistant", text: `[error] ${(e as Error).message}` },
@@ -124,7 +140,7 @@ export function useChat(options: UseChatOptions = {}) {
         }
       }
     },
-    [apiKey, busy, ensureChat, provider, redact, showTokens],
+    [apiKey, busy, chatId, ensureChat, provider, redact, showTokens],
   );
 
   /** Load an existing chat (from History) into this panel. */

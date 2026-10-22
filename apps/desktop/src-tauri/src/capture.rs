@@ -3,15 +3,11 @@
 //! trapping the user). A global-Escape failsafe force-restores the window even if the
 //! webview ever freezes, so region mode can never lock the desktop.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use base64::Engine;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
-
-#[tauri::command]
-/// Frontend log sink for debugging.
-pub fn log_frontend(message: String) {
-    println!("[frontend] {message}");
-}
 
 fn encode_png(buffer: &[u8], width: u32, height: u32) -> Result<String, String> {
     let mut png_data = Vec::new();
@@ -44,9 +40,14 @@ fn restore_main(app: &AppHandle) {
     }
 }
 
+/// Bumped on every arm, so a delayed self-unregister from an earlier region session
+/// cannot drop the Escape a newer session has armed.
+static ESCAPE_ARM: AtomicU64 = AtomicU64::new(0);
+
 #[tauri::command]
 /// Arm a global Escape that cancels region mode even if the webview is unresponsive.
 pub fn arm_region_escape(app: AppHandle) -> Result<(), String> {
+    let arm = ESCAPE_ARM.fetch_add(1, Ordering::SeqCst) + 1;
     let handle = app.clone();
     app.global_shortcut()
         .on_shortcut("Escape", move |_app, _sc, event| {
@@ -57,6 +58,15 @@ pub fn arm_region_escape(app: AppHandle) -> Result<(), String> {
             if let Some(main) = handle.get_webview_window("main") {
                 let _ = main.emit("region-cancel", ());
             }
+            // Release Escape here rather than trusting the webview's disarm call, which
+            // never arrives if the webview is dead. Off-thread: the plugin holds its
+            // shortcut lock while running this handler, so unregistering inline deadlocks.
+            let handle = handle.clone();
+            std::thread::spawn(move || {
+                if ESCAPE_ARM.load(Ordering::SeqCst) == arm {
+                    let _ = handle.global_shortcut().unregister("Escape");
+                }
+            });
         })
         .map_err(|e| e.to_string())
 }

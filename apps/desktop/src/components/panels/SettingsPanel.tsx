@@ -1,4 +1,6 @@
+import { useState } from "react";
 import { PROVIDER_LABELS, detectProvider } from "../../hooks/useSettings";
+import { registerShortcut } from "../../lib/tauri";
 import type { Provider, Settings, ThemeName } from "../../types";
 
 const PROVIDERS: Provider[] = ["ollama", "openai", "anthropic", "deepseek"];
@@ -54,6 +56,26 @@ export function SettingsPanel({ settings, update, theme, setTheme, apiKey, setAp
       const guess = detectProvider(key);
       if (guess !== "ollama") update("provider", guess);
     }
+  };
+
+  // The shortcut is edited as a draft and only bound on blur/Enter: binding on every
+  // keystroke would try half-typed accelerators. A rejected one keeps the old hotkey.
+  const [shortcutDraft, setShortcutDraft] = useState(settings.shortcut);
+  const [shortcutError, setShortcutError] = useState<string | null>(null);
+  const commitShortcut = () => {
+    const next = shortcutDraft.trim();
+    if (!next || next === settings.shortcut) {
+      setShortcutDraft(settings.shortcut);
+      setShortcutError(null);
+      return;
+    }
+    registerShortcut(next).then(
+      () => {
+        setShortcutError(null);
+        update("shortcut", next);
+      },
+      (err) => setShortcutError(`Not set: ${String(err)}`),
+    );
   };
 
   const toggle = (key: BooleanSettingKey) => update(key, !settings[key]);
@@ -140,10 +162,19 @@ export function SettingsPanel({ settings, update, theme, setTheme, apiKey, setAp
           <span className="gv-sr-name">Global trigger</span>
           <input
             className="gv-kbd-input"
-            value={settings.shortcut}
-            onChange={(e) => update("shortcut", e.target.value)}
+            value={shortcutDraft}
+            onChange={(e) => setShortcutDraft(e.target.value)}
+            onBlur={commitShortcut}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") e.currentTarget.blur();
+            }}
           />
         </div>
+        {shortcutError && (
+          <div className="gv-sr">
+            <span className="gv-sr-val">{shortcutError}</span>
+          </div>
+        )}
       </div>
 
       <div className="gv-sg">

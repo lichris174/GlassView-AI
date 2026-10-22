@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow, currentMonitor } from "@tauri-apps/api/window";
 import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 export function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -31,6 +32,17 @@ export const disarmRegionEscape = () =>
   isTauri() ? invoke("disarm_region_escape") : Promise.resolve();
 export const registerShortcut = (accelerator: string) =>
   isTauri() ? invoke("register_shortcut", { accelerator }) : Promise.resolve();
+
+/** Open an http(s) link in the system browser. The webview drops target="_blank"
+ *  navigations on its own, so links must go through the opener plugin; a plain
+ *  browser just opens a new tab. */
+export async function openExternal(url: string): Promise<void> {
+  if (!isTauri()) {
+    window.open(url, "_blank", "noopener,noreferrer");
+    return;
+  }
+  await openUrl(url);
+}
 
 // ── Launch on login (tauri-plugin-autostart) ────────────────────────────────
 // Called through the plugin's command names rather than its JS package so the
