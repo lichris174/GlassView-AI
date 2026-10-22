@@ -18,11 +18,22 @@ prediction side:
   at least one box. This is the metric for block mode.
 
 **Detection metric (what ML readers expect).** Per-class average precision at
-IoU 0.5 (VOC-style, all-point interpolation) and its mean, mAP@0.5.
+IoU 0.5 (VOC-style, all-point interpolation) and its mean, mAP@0.5. A system
+that gives every box the same score (ocr_regex, qwen_vl, block_all) has a
+single operating point, so its "AP" collapses to recall x precision at that
+point. It is not comparable to the AP of a detector with real confidences;
+compare those systems on the privacy metrics instead.
+
+Ground-truth boxes with zero area (a slip of the labeling tool) are ignored
+everywhere: they cannot be blurred or matched, so counting them would report a
+miss no system could avoid.
 
 Uncertainty: confidence intervals use a *cluster bootstrap over sessions*.
 Frames in a session are near-copies, so resampling individual frames would
 treat them as independent evidence and produce intervals that are too narrow.
+Replicates where a metric is undefined (e.g. no clean frame was drawn) are left
+out and counted; if more than ``MAX_UNDEFINED`` of them are, the interval is
+undefined (NaN) rather than a misleadingly narrow one.
 """
 
 from __future__ import annotations
@@ -36,6 +47,10 @@ from dataclasses import dataclass, field
 from .labels import CLASSES, Box
 
 DEFAULT_COVERAGE = 0.9
+# Share of bootstrap replicates allowed to be undefined before the interval is
+# reported as undefined. Many undefined replicates mean the metric rests on one
+# or two sessions, and the surviving replicates mostly repeat the same value.
+MAX_UNDEFINED = 0.1
 
 
 # --- geometry ----------------------------------------------------------------
@@ -74,6 +89,17 @@ def covered_area(rects: Sequence[Box], within: Sequence[Box] | None = None) -> f
     return total
 
 
+def clip_boxes(boxes: Sequence[Box], width: float, height: float) -> list[Box]:
+    """Boxes cut to the image. Area off the screen blurs nothing, so it must not
+    count against blur precision; boxes left with no area are dropped."""
+    out = []
+    for b in boxes:
+        c = Box(b.cls, max(0.0, b.x1), max(0.0, b.y1), min(width, b.x2), min(height, b.y2), b.score)
+        if c.area > 0:
+            out.append(c)
+    return out
+
+
 # --- per-frame statistics ------------------------------------------------------
 @dataclass
 class FrameStats:
@@ -87,6 +113,7 @@ class FrameStats:
     pred_area: float = 0.0
     pred_on_gt: float = 0.0
     any_pred: bool = False
+    gt_degenerate: int = 0  # zero-area label boxes, ignored by every metric
 
     @property
     def clean(self) -> bool:
@@ -98,8 +125,11 @@ def frame_stats(
 ) -> FrameStats:
     s = FrameStats(session=session, any_pred=bool(preds))
     for g in gts:
+        if g.area <= 0:
+            s.gt_degenerate += 1  # nothing to protect; counted so it gets fixed
+            continue
         s.gt_count[g.cls] = s.gt_count.get(g.cls, 0) + 1
-        if g.area > 0 and covered_area(preds, [g]) / g.area >= coverage:
+        if covered_area(preds, [g]) / g.area >= coverage:
             s.gt_protected[g.cls] = s.gt_protected.get(g.cls, 0) + 1
     s.gt_area = covered_area(gts)
     s.gt_covered = covered_area(preds, gts)
@@ -145,9 +175,14 @@ def average_precision(
     Predictions with tied scores are treated as one rank: precision/recall points
     are only emitted between distinct scores. Otherwise a system whose scores are
     all 1.0 (the OCR and VLM baselines) would get an AP that depends on the
-    arbitrary order frames happen to be listed in.
+    arbitrary order frames happen to be listed in. The flip side: such a system
+    yields ONE precision/recall point, so its AP is just recall x precision
+    there, not an area under a curve. Do not rank it against a scored detector
+    by AP.
+
+    Zero-area ground truth is ignored (it can never be matched).
     """
-    n_gt = sum(1 for gts, _ in frames for g in gts if g.cls == cls)
+    n_gt = sum(1 for gts, _ in frames for g in gts if g.cls == cls and g.area > 0)
     if n_gt == 0:
         return math.nan
     scored = sorted(
@@ -158,7 +193,7 @@ def average_precision(
     points: list[tuple[float, float]] = []  # (recall, precision) at each distinct score
     tp = fp = 0
     for k, (score, i, p) in enumerate(scored):
-        gts = [g for g in frames[i][0] if g.cls == cls]
+        gts = [g for g in frames[i][0] if g.cls == cls and g.area > 0]
         overlaps = [iou(p, g) for g in gts]
         best_j = max(range(len(gts)), key=overlaps.__getitem__, default=-1)
         if best_j >= 0 and overlaps[best_j] >= iou_thr and best_j not in used[i]:
@@ -227,6 +262,16 @@ def _by_session(stats: Sequence[FrameStats]) -> list[list[int]]:
     return [groups[k] for k in sorted(groups)]
 
 
+@dataclass(frozen=True)
+class Interval:
+    """A bootstrap interval and how many replicates it could not use."""
+
+    lo: float
+    hi: float
+    undefined: int  # replicates where the metric was NaN (left out)
+    n: int  # replicates drawn
+
+
 def _percentile_ci(values: list[float], level: float) -> tuple[float, float]:
     """Percentile interval. With few sessions it under-covers, so callers report
     ``num_sessions`` next to it and the intervals are labeled approximate."""
@@ -238,16 +283,64 @@ def _percentile_ci(values: list[float], level: float) -> tuple[float, float]:
     return vals[lo_i], vals[hi_i]
 
 
-def bootstrap_ci(
-    stats: Sequence[FrameStats], metric: Metric, n: int = 2000, level: float = 0.95, seed: int = 0
-) -> tuple[float, float]:
+def _interval(values: list[float], level: float, max_undefined: float) -> Interval:
+    undefined = sum(math.isnan(v) for v in values)
+    if values and undefined / len(values) > max_undefined:
+        return Interval(math.nan, math.nan, undefined, len(values))
+    lo, hi = _percentile_ci(values, level)
+    return Interval(lo, hi, undefined, len(values))
+
+
+def bootstrap_interval(
+    stats: Sequence[FrameStats],
+    metric: Metric,
+    n: int = 2000,
+    level: float = 0.95,
+    seed: int = 0,
+    max_undefined: float = MAX_UNDEFINED,
+) -> Interval:
     """Percentile CI from resampling whole sessions with replacement."""
     groups, rng = _by_session(stats), random.Random(seed)
     values = []
     for _ in range(n):
         sample = [stats[i] for _ in groups for i in rng.choice(groups)]
         values.append(metric(sample))
-    return _percentile_ci(values, level)
+    return _interval(values, level, max_undefined)
+
+
+def bootstrap_ci(
+    stats: Sequence[FrameStats], metric: Metric, n: int = 2000, level: float = 0.95, seed: int = 0
+) -> tuple[float, float]:
+    """(lo, hi) of :func:`bootstrap_interval`."""
+    iv = bootstrap_interval(stats, metric, n, level, seed)
+    return iv.lo, iv.hi
+
+
+def paired_bootstrap_interval(
+    a: Sequence[FrameStats],
+    b: Sequence[FrameStats],
+    metric: Metric,
+    n: int = 2000,
+    level: float = 0.95,
+    seed: int = 0,
+    max_undefined: float = MAX_UNDEFINED,
+) -> tuple[float, Interval]:
+    """metric(a) - metric(b) with a CI, resampling the SAME sessions for both.
+
+    ``a`` and ``b`` must be stats for the same frames in the same order. Pairing
+    removes frame difficulty from the comparison, so a real difference shows up
+    with fewer frames than two independent intervals would need. If the
+    interval excludes 0, the difference is significant at that level; an
+    undefined (NaN) interval is never significant.
+    """
+    if [s.session for s in a] != [s.session for s in b]:
+        raise ValueError("paired comparison needs the same frames in the same order")
+    groups, rng = _by_session(a), random.Random(seed)
+    diffs = []
+    for _ in range(n):
+        idx = [i for _ in groups for i in rng.choice(groups)]
+        diffs.append(metric([a[i] for i in idx]) - metric([b[i] for i in idx]))
+    return metric(a) - metric(b), _interval(diffs, level, max_undefined)
 
 
 def paired_bootstrap_diff(
@@ -258,19 +351,6 @@ def paired_bootstrap_diff(
     level: float = 0.95,
     seed: int = 0,
 ) -> tuple[float, float, float]:
-    """metric(a) - metric(b) with a CI, resampling the SAME sessions for both.
-
-    ``a`` and ``b`` must be stats for the same frames in the same order. Pairing
-    removes frame difficulty from the comparison, so a real difference shows up
-    with fewer frames than two independent intervals would need. If the
-    interval excludes 0, the difference is significant at that level.
-    """
-    if [s.session for s in a] != [s.session for s in b]:
-        raise ValueError("paired comparison needs the same frames in the same order")
-    groups, rng = _by_session(a), random.Random(seed)
-    diffs = []
-    for _ in range(n):
-        idx = [i for _ in groups for i in rng.choice(groups)]
-        diffs.append(metric([a[i] for i in idx]) - metric([b[i] for i in idx]))
-    lo, hi = _percentile_ci(diffs, level)
-    return metric(a) - metric(b), lo, hi
+    """(diff, lo, hi) of :func:`paired_bootstrap_interval`."""
+    d, iv = paired_bootstrap_interval(a, b, metric, n, level, seed)
+    return d, iv.lo, iv.hi

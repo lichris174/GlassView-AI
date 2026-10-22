@@ -25,11 +25,14 @@ from ..labels import CLASSES, Box
 
 PROMPT = """Find every region of this screenshot that would be harmful to send to a third party.
 Use exactly these labels:
-- credential: filled password fields, visible passwords, one-time or recovery codes
+- credential: filled password fields, visible passwords, one-time or recovery codes,
+  security-question answers, and the filled username or email field of a sign-in form
+  (one region per field)
 - api_key: API keys, tokens, secrets, private keys, connection strings with passwords
 - financial: card numbers, account or routing numbers, IBANs, account balances, transactions
 - private_message: message bodies in chat or email apps, including inbox previews
-- personal_id: faces, ID documents, government ID numbers, home addresses, dates of birth
+- personal_id: faces, ID documents, government ID numbers, dates of birth, and a person's
+  full name, phone number, email, or home address entered in a form or document
 
 Answer with only a JSON array, one object per region:
 [{"label": "<label>", "bbox_2d": [x1, y1, x2, y2]}]

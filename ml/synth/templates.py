@@ -8,7 +8,13 @@ follows docs/LABELING_GUIDE.md, notably:
 - only the secret *value* is tagged, never its label (``API_KEY=`` stays out);
 - empty login forms, prices, and variable names are left untagged on purpose,
   as hard negatives the model must learn to ignore;
-- adjacent message bubbles form one ``private_message`` region.
+- adjacent message bubbles form one ``private_message`` region;
+- (2026-10-20 change log) a filled sign-in username/email is ``credential``,
+  one box per field, and a person's name, phone, email, or address entered in
+  a form is ``personal_id``.
+
+Tagged and untagged elements must look alike: pass styling through ``s()``'s
+``css`` argument (class names only), never a ``class="..."`` string.
 """
 
 from __future__ import annotations
@@ -32,6 +38,14 @@ def s(cls: str, inner: str, tag: str = "span", css: str = "") -> str:
     """Wrap pre-escaped HTML as a sensitive region of class ``cls``."""
     klass = f' class="{css}"' if css else ""
     return f'<{tag} data-s="{cls}"{klass}>{inner}</{tag}>'
+
+
+def tagged_input(cls: str, value: str, type_: str = "text") -> str:
+    """A filled form field tagged on the ``<input>`` itself, so its box is exactly
+    the field and its layout matches an untagged input (a wrapping block element
+    would change the input's width and make a loose box)."""
+    kind = f' type="{type_}"' if type_ != "text" else ""
+    return f'<input data-s="{cls}"{kind} value="{value}">'
 
 
 def initials(name: str) -> str:
@@ -81,8 +95,10 @@ def email(r: random.Random, fk: Faker) -> str:
                    for _ in range(r.randrange(2, 4)))
     reading = (
         f'<section class="col grow pad"><h2>{esc(F.subject(r, fk))}</h2>'
-        f'<div class="muted">{esc(fk.name())} &lt;{esc(fk.email())}&gt;</div>'
-        f'{s("private_message", body, "div")}</section>'
+        # Sender and body form one region, like the inbox rows.
+        + s("private_message",
+            f'<div class="muted">{esc(fk.name())} &lt;{esc(fk.email())}&gt;</div>{body}', "div")
+        + '</section>'
     ) if r.random() < 0.7 else ""
     folders = ["Inbox", "Starred", "Sent", "Drafts", "Spam", "Archive"]
     return (
@@ -105,7 +121,7 @@ def bank(r: random.Random, fk: Faker) -> str:
         f"</div></div>"
         for name in r.sample(("Checking", "Savings", "Credit card", "Joint"), r.randrange(1, 4))
     )
-    addr = (f'<div class="pad muted">Customer: {esc(fk.name())}<br>'
+    addr = (f'<div class="pad muted">Customer: {s("personal_id", esc(fk.name()))}<br>'
             f'{s("personal_id", esc(fk.address()).replace(chr(10), "<br>"))}</div>'
             if r.random() < 0.4 else "")
     return (
@@ -120,19 +136,20 @@ def login(r: random.Random, fk: Faker) -> str:
     filled = r.random() < 0.75  # empty forms are hard negatives
     show = r.random() < 0.25
     pw = fk.password(length=r.randrange(9, 16))
-    user = f'value="{esc(fk.email())}"' if filled else 'placeholder="Email"'
+    # A filled sign-in username/email is a credential too (guide, 2026-10-20).
     if filled:
-        field = f'<input type="{"text" if show else "password"}" value="{esc(pw)}">'
-        pw_html = s("credential", field, "div")
+        user_html = tagged_input("credential", esc(fk.email()))
+        pw_html = tagged_input("credential", esc(pw), "text" if show else "password")
     else:
+        user_html = '<input placeholder="Email">'
         pw_html = '<input type="password" placeholder="Password">'
     otp = ""
     if filled and r.random() < 0.3:
-        code_input = f'<input value="{F.rand(r, 6, "0123456789")}">'
-        otp = f'<label>Verification code</label>{s("credential", code_input, "div")}'
+        otp = (f'<label>Verification code</label>'
+               f'{tagged_input("credential", F.rand(r, 6, "0123456789"))}')
     return (
         f'<div class="app center"><form class="panel pad col gap" style="width:360px">'
-        f'<h2>Sign in to {esc(fk.company())}</h2><label>Email</label><input {user}>'
+        f'<h2>Sign in to {esc(fk.company())}</h2><label>Email</label>{user_html}'
         f'<label>Password</label>{pw_html}{otp}<button>Sign in</button>'
         f'<a class="muted">Forgot password?</a></form></div>'
     )
@@ -144,7 +161,7 @@ def vault(r: random.Random, fk: Faker) -> str:
     shown = esc(pw) if r.random() < 0.5 else "•" * len(pw)
     detail = (
         f'<section class="col grow pad gap"><h2>{esc(sites[0])}</h2>'
-        f'<label>Username</label><div class="field">{esc(fk.user_name())}</div>'
+        f'<label>Username</label>{s("credential", esc(fk.user_name()), "div", css="field")}'
         f'<label>Password</label>{s("credential", shown, "div", css="field mono")}'
     )
     if r.random() < 0.5:
@@ -209,28 +226,34 @@ def checkout(r: random.Random, fk: Faker) -> str:
     items = "".join(f'<div class="row between"><span>{esc(fk.word().title())} '
                     f'{esc(fk.word())}</span><span>{F.money(r, 5, 300)}</span></div>'
                     for _ in range(r.randrange(2, 5)))  # prices: negative
-    card_block = (f'<label>Card number</label><input value="{esc(F.card(r, fk))}">'
-                  f'<div class="row gap"><input value="{esc(fk.credit_card_expire())}">'
-                  f'<input value="{esc(fk.credit_card_security_code())}"></div>')
-    addr = f'<label>Shipping address</label><textarea>{esc(fk.address())}</textarea>'
+    # Only values are tagged, one box per field; the <label> texts stay out.
+    card_block = (f'<label>Card number</label>{tagged_input("financial", esc(F.card(r, fk)))}'
+                  f'<div class="row gap">{tagged_input("financial", esc(fk.credit_card_expire()))}'
+                  f'{tagged_input("financial", esc(fk.credit_card_security_code()))}</div>')
+    addr = (f'<label>Shipping address</label>'
+            f'<textarea data-s="personal_id">{esc(fk.address())}</textarea>')
+    shop = esc(r.choice(F.SHOPS))
+    buyer = tagged_input("personal_id", esc(fk.name()))  # a name entered in a form
     return (
-        f'<div class="app row"><main class="col grow pad gap"><h2>{esc(r.choice(F.SHOPS))} checkout</h2>'
-        f'<label>Name</label><input value="{esc(fk.name())}">'
-        f'{s("personal_id", addr, "div", css="col gap")}'
-        f'{s("financial", card_block, "div", css="col gap")}<button>Pay now</button></main>'
+        f'<div class="app row"><main class="col grow pad gap"><h2>{shop} checkout</h2>'
+        f'<label>Name</label>{buyer}{addr}{card_block}<button>Pay now</button></main>'
         f'<aside class="side pad col gap"><h3>Order summary</h3>{items}</aside></div>'
     )
 
 
 def profile(r: random.Random, fk: Faker) -> str:
-    fields = [("Full name", esc(fk.name()), None),
+    # A full name is a contact detail (personal_id); a username is not, so it
+    # stays untagged as a hard negative.
+    fields = [("Full name", esc(fk.name()), "personal_id"),
               ("Date of birth", esc(fk.date_of_birth(minimum_age=18, maximum_age=80)), "personal_id"),
               ("Home address", esc(fk.address()).replace("\n", ", "), "personal_id"),
               ("SSN", esc(fk.ssn()), "personal_id"),
               ("Phone", esc(fk.phone_number()), "personal_id"),
               ("Username", esc(fk.user_name()), None)]
     r.shuffle(fields)
-    rows = "".join(f'<label>{k}</label>' + (s(c, v, "div", 'class="field"') if c else f'<div class="field">{v}</div>')
+    # Every field shares the .field style, so styling never gives a label away.
+    rows = "".join(f'<label>{k}</label>' + (s(c, v, "div", css="field") if c
+                                             else f'<div class="field">{v}</div>')
                    for k, v, c in fields[:r.randrange(3, 7)])
     idcard = ""
     if r.random() < 0.4:

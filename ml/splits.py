@@ -110,6 +110,16 @@ def assign(
         prev = json.loads(out.read_text(encoding="utf-8"))
         known = {n for sp in prev["splits"].values() for n in sp["sessions"]}
         assignment = {k: list(prev["splits"][k]["sessions"]) for k in SPLITS}
+        on_disk = {s.name for s in sessions}
+        missing = {k: [n for n in assignment[k] if n not in on_disk] for k in SPLITS}
+        if any(missing.values()):
+            gone = "; ".join(f"{k}: {', '.join(ns)}" for k, ns in missing.items() if ns)
+            hint = ("The test set is frozen: restore those sessions from backup, then run verify."
+                    if missing["test"] else
+                    "Restore them, or delete them from splits.json by hand if they were "
+                    "removed on purpose (e.g. accidental real content).")
+            raise SystemExit(f"Session(s) recorded in {out.name} are missing under {root}: "
+                             f"{gone}. {hint}")
         new = [s.name for s in sessions if s.name not in known]
         # The test set is frozen, and val stays fixed so model selection stays
         # comparable across runs; anything captured later is training data.

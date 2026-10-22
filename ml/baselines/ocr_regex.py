@@ -1,9 +1,11 @@
-"""Baseline: what GlassView does today, turned into boxes.
+"""Baseline: the app's text-redaction regexes, applied to screen pixels via OCR.
 
-Tesseract reads every word with its position; the app's own redaction rules
-(glassview_ai/privacy/redact.py) run over each line of text; the words a match
-touches become a box. This is the strongest *rule-based* system available
-without training, and the one the detector has to beat to justify itself.
+The app uses these rules (glassview_ai/privacy/redact.py) only on text it
+stores in memory; it does not run them on screenshots. Here Tesseract reads
+every word with its position, the same rules run over each line of text, and
+the words a match touches become a box. This is the strongest *rule-based*
+system available without training, and the one the detector has to beat to
+justify itself.
 
 Known blind spots, by design of the approach rather than of this code: it can
 only find text (no faces or ID photos), it misses what OCR misreads, and the

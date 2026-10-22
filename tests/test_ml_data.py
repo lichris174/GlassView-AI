@@ -108,3 +108,18 @@ def test_refuses_to_freeze_with_too_few_sessions(tmp_path: Path) -> None:
     _make_raw(tmp_path / "raw", {"only": 3})
     with pytest.raises(SystemExit):
         assign(tmp_path / "raw", tmp_path / "splits.json", 0.35, 0.15, seed=0)
+
+
+def test_assign_names_a_deleted_session_instead_of_crashing(tmp_path: Path) -> None:
+    import json
+    import shutil
+
+    raw, out = tmp_path / "raw", tmp_path / "splits.json"
+    _make_raw(raw, {f"s{i}": 3 for i in range(6)})
+    first = assign(raw, out, 0.35, 0.15, seed=0)
+    gone = first["splits"]["train"]["sessions"][0]
+    shutil.rmtree(raw / gone)
+    with pytest.raises(SystemExit, match=gone):
+        assign(raw, out, 0.35, 0.15, seed=0)
+    assert json.loads(out.read_text()) == first  # manifest not rewritten
+    assert verify(raw, out) == []  # test set untouched

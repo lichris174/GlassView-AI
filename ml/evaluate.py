@@ -2,22 +2,32 @@
 
     python -m ml.evaluate run --system ocr_regex --split test
     python -m ml.evaluate pick-threshold results/<val-run> --target-recall 0.95
-    python -m ml.evaluate score results/<run> --threshold 0.42
-    python -m ml.evaluate compare results/<run-a> results/<run-b>
+    python -m ml.evaluate score results/<run> --threshold 0.42 [--coverage 0.9]
+    python -m ml.evaluate compare results/<run-a> results/<run-b> [--coverage 0.9]
 
 Each run writes ``results/<timestamp>-<system>-<split>/`` containing:
 
 - ``manifest.json``: what produced the numbers (git commit and whether the tree
-  was dirty, the frozen split's hash, system config, machine, threshold).
+  was dirty, the frozen split's hash, per-frame label digests, system config,
+  machine, threshold and where it came from, coverage).
 - ``predictions.jsonl``: every predicted box and per-frame latency, so scores
   can be recomputed without re-running the model.
-- ``metrics.json``: point estimates with 95% session-bootstrap intervals.
+- ``metrics.json``: point estimates with 95% session-bootstrap intervals, at the
+  run's own threshold and coverage. Re-scoring at any other operating point
+  (``score --threshold`` / ``--coverage``) writes ``metrics-t<X>[-c<Y>].json``
+  instead, with its ``threshold_source`` recorded, so the run's own numbers are
+  never overwritten by a hand-picked threshold.
 
 Latency is the wall time of ``predict()`` alone (image already decoded), so it
 includes everything a system needs per frame: OCR for ocr_regex, PNG encoding
 plus the HTTP round trip for qwen_vl. The first frames are excluded as warmup
-(model load, caches). Intervals are approximate: with ~10 test sessions a
-percentile bootstrap under-covers, so ``num_sessions`` is reported beside them.
+(model load, caches). Intervals are approximate: the frozen test split has only
+5 sessions, and a percentile bootstrap over that few under-covers, so
+``num_sessions`` and the count of undefined replicates are reported beside them.
+
+AP caveat: the baselines give every box the same score, so their AP is a single
+precision/recall point (about recall x precision), not comparable to the AP of a
+detector with real confidences. Compare baselines on the privacy metrics.
 
 Any number quoted in the README or a resume should be traceable to one of
 these folders.
@@ -78,10 +88,13 @@ def load_split(split: str) -> tuple[list[tuple[str, list[Box]]], dict]:
             unlabeled.append(frame)
         else:
             frames.append((frame, gts))
+    labeled = [f for f, _ in frames]
     return frames, {
         "split": split,
         "hash": info["hash"],
-        "labels_hash": labels_hash([f for f, _ in frames]),
+        # Kept for manifests written before label_digests existed.
+        "labels_hash": labels_hash(labeled),
+        "label_digests": label_digests(labeled),
         "unlabeled": unlabeled,
     }
 
@@ -94,6 +107,27 @@ def labels_hash(frames: list[str]) -> str:
         h.update(f"{frame}\n".encode())
         h.update(label_path(frame).read_bytes())
     return h.hexdigest()
+
+
+def label_digests(frames: list[str]) -> dict[str, str]:
+    """SHA-256 of each frame's label file. Lets scoring compare exactly the frames
+    it scores, whatever subset of the run's frames has predictions."""
+    return {f: hashlib.sha256(label_path(f).read_bytes()).hexdigest() for f in sorted(frames)}
+
+
+def _labels_changed(split_manifest: dict, frames: list[str]) -> list[str] | bool:
+    """Scored frames whose labels differ from the run's. Old manifests only hold
+    one hash over all frames, which is exact only when every frame was scored."""
+    stored = split_manifest.get("label_digests")
+    if stored is None:
+        return labels_hash(frames) != split_manifest.get("labels_hash")
+    now = label_digests(frames)
+    return [f for f in frames if stored.get(f) != now[f]]
+
+
+def _image_size(frame: str) -> tuple[int, int]:
+    with Image.open(raw_dir() / frame) as im:  # reads the header only
+        return im.size
 
 
 def session_of(frame: str) -> str:
@@ -167,8 +201,24 @@ def _clean(v: float) -> float | None:
     return None if isinstance(v, float) and math.isnan(v) else round(v, 4)
 
 
-def score(run: Path, threshold: float, coverage: float = M.DEFAULT_COVERAGE) -> dict:
-    """Score saved predictions against the split's current labels."""
+def _clipped(frame: str, boxes: list[Box]) -> list[Box]:
+    """Predictions cut to the frame, so off-screen area never counts as blurred."""
+    return M.clip_boxes(boxes, *_image_size(frame))
+
+
+def score(
+    run: Path,
+    threshold: float,
+    coverage: float = M.DEFAULT_COVERAGE,
+    threshold_source: str | None = None,
+) -> dict:
+    """Score saved predictions against the split's current labels.
+
+    At the run's own threshold and coverage, with no ``threshold_source``, this
+    (re)writes ``metrics.json``. Anything else is a different operating point:
+    it goes to ``metrics-t<threshold>[-c<coverage>].json`` with its source
+    recorded (``threshold_source``, default "manual").
+    """
     manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
     frames, split_info = load_split(manifest["split"]["split"])
     if split_info["hash"] != manifest["split"]["hash"]:
@@ -178,42 +228,65 @@ def score(run: Path, threshold: float, coverage: float = M.DEFAULT_COVERAGE) -> 
     # predictions; they are skipped and counted rather than crashing.
     skipped = [f for f, _ in frames if f not in preds]
     frames = [(f, g) for f, g in frames if f in preds]
-    labels_changed = labels_hash([f for f, _ in frames]) != manifest["split"].get("labels_hash")
+    changed = _labels_changed(manifest["split"], [f for f, _ in frames])
 
     # AP sweeps every confidence level, so it uses all predictions; privacy
     # metrics describe the deployed system, so they use the operating threshold.
-    all_preds = [(session_of(f), g, preds[f]["boxes"]) for f, g in frames]
+    all_preds = [(session_of(f), g, _clipped(f, preds[f]["boxes"])) for f, g in frames]
     stats = [M.frame_stats(s, g, M.above(p, threshold), coverage) for s, g, p in all_preds]
     values = {**M.privacy_metrics(stats), **M.detection_metrics([(g, p) for _, g, p in all_preds])}
-    cis = {k: M.bootstrap_ci(stats, lambda st, k=k: M.privacy_metrics(st)[k]) for k in CI_METRICS}
+    cis = {k: M.bootstrap_interval(stats, lambda st, k=k: M.privacy_metrics(st)[k])
+           for k in CI_METRICS}
 
+    same_threshold = threshold == manifest["threshold"]
+    own = (threshold_source is None and same_threshold
+           and coverage == manifest.get("coverage", M.DEFAULT_COVERAGE))
+    # Re-scoring the run's threshold at another coverage keeps its provenance.
+    source = threshold_source or (
+        manifest.get("threshold_source", "fixed") if same_threshold else "manual"
+    )
     latencies = [preds[f]["latency_ms"] for f, _ in frames][WARMUP_FRAMES:]
     result = {
         "threshold": threshold,
+        "threshold_source": source,
         "coverage": coverage,
         "num_frames": len(frames),
         "skipped_frames": skipped,
         # True means labels were edited after the predictions were made (e.g.
         # fixing mistakes). Scores are then against the new labels; say so.
-        "labels_changed_since_run": labels_changed,
+        "labels_changed_since_run": bool(changed),
+        **({"labels_changed_frames": changed} if isinstance(changed, list) and changed else {}),
         "num_sessions": len({s.session for s in stats}),
         "num_clean_frames": sum(s.clean for s in stats),
+        # Zero-area label boxes: ignored by every metric, counted so they get fixed.
+        "num_degenerate_gt_ignored": sum(s.gt_degenerate for s in stats),
         "num_regions": {
             c: sum(s.gt_count.get(c, 0) for s in stats) for c in sorted(
                 {c for s in stats for c in s.gt_count}
             )
         },
         "metrics": {k: _clean(v) for k, v in values.items()},
-        "ci95": {k: [_clean(lo), _clean(hi)] for k, (lo, hi) in cis.items()},
+        "ci95": {k: [_clean(iv.lo), _clean(iv.hi)] for k, iv in cis.items()},
+        # Replicates where the metric was undefined (e.g. no clean frame drawn)
+        # are left out; too many and the interval above is null.
+        "ci95_undefined_replicates": {k: iv.undefined for k, iv in cis.items()},
+        "bootstrap_replicates": next(iter(cis.values())).n,
         "latency_ms": {
             "median": _clean(statistics.median(latencies)) if latencies else None,
             "p95": _clean(_p95(latencies)) if latencies else None,
             "warmup_frames_excluded": WARMUP_FRAMES,
         },
     }
-    name = "metrics.json" if threshold == manifest["threshold"] else f"metrics-t{threshold:g}.json"
+    name = "metrics.json" if own else _metrics_name(threshold, coverage)
     (run / name).write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
+
+
+def _metrics_name(threshold: float, coverage: float) -> str:
+    # repr is the shortest exact form, so distinct thresholds never share a file
+    # (":g" would map 0.4200001 and 0.42 to the same name).
+    cov = "" if coverage == M.DEFAULT_COVERAGE else f"-c{float(coverage)!r}"
+    return f"metrics-t{float(threshold)!r}{cov}.json"
 
 
 def _p95(values: list[float]) -> float:
@@ -227,6 +300,7 @@ def run(
     threshold: float,
     allow_partial: bool,
     threshold_source: str = "fixed",
+    coverage: float = M.DEFAULT_COVERAGE,
 ) -> Path:
     frames, split_info = load_split(split)
     if split_info["unlabeled"] and not allow_partial:
@@ -245,6 +319,7 @@ def run(
         # "fixed", or the val run it was picked from, so a threshold tuned on
         # test cannot pass silently.
         "threshold_source": threshold_source,
+        "coverage": coverage,
         "started_at": datetime.now().isoformat(timespec="seconds"),
         **provenance(),
     }
@@ -253,11 +328,24 @@ def run(
     manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
     manifest["config"] = predictor.config  # may gain run stats, e.g. parse failures
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    score(out, threshold)
+    score(out, threshold, coverage)
     return out
 
 
-def compare(run_a: Path, run_b: Path, threshold_a: float, threshold_b: float) -> dict:
+def _significant(lo: float, hi: float) -> bool:
+    """The interval excludes 0. An undefined (NaN) interval shows nothing."""
+    if math.isnan(lo) or math.isnan(hi):
+        return False
+    return not (lo <= 0 <= hi)
+
+
+def compare(
+    run_a: Path,
+    run_b: Path,
+    threshold_a: float,
+    threshold_b: float,
+    coverage: float = M.DEFAULT_COVERAGE,
+) -> dict:
     """Paired difference (a minus b) on the frames both runs share."""
     ma = json.loads((run_a / "manifest.json").read_text(encoding="utf-8"))
     mb = json.loads((run_b / "manifest.json").read_text(encoding="utf-8"))
@@ -266,15 +354,21 @@ def compare(run_a: Path, run_b: Path, threshold_a: float, threshold_b: float) ->
     pa, pb = load_predictions(run_a), load_predictions(run_b)
     frames, _ = load_split(ma["split"]["split"])
     frames = [(f, g) for f, g in frames if f in pa and f in pb]
-    sa = [M.frame_stats(session_of(f), g, M.above(pa[f]["boxes"], threshold_a)) for f, g in frames]
-    sb = [M.frame_stats(session_of(f), g, M.above(pb[f]["boxes"], threshold_b)) for f, g in frames]
+
+    def stats(preds: dict[str, dict], threshold: float) -> list[M.FrameStats]:
+        return [M.frame_stats(session_of(f), g, M.above(_clipped(f, preds[f]["boxes"]), threshold),
+                              coverage) for f, g in frames]
+
+    sa, sb = stats(pa, threshold_a), stats(pb, threshold_b)
     # Five metrics with no multiple-comparison correction: treat "significant"
     # as descriptive, and name in advance the one metric a claim rests on.
-    out: dict = {"num_frames": len(frames), "num_sessions": len({session_of(f) for f, _ in frames})}
+    out: dict = {"num_frames": len(frames), "num_sessions": len({session_of(f) for f, _ in frames}),
+                 "coverage": coverage}
     for k in CI_METRICS:
-        d, lo, hi = M.paired_bootstrap_diff(sa, sb, lambda st, k=k: M.privacy_metrics(st)[k])
-        out[k] = {"diff": _clean(d), "ci95": [_clean(lo), _clean(hi)],
-                  "significant": not (lo <= 0 <= hi)}
+        d, iv = M.paired_bootstrap_interval(sa, sb, lambda st, k=k: M.privacy_metrics(st)[k])
+        out[k] = {"diff": _clean(d), "ci95": [_clean(iv.lo), _clean(iv.hi)],
+                  "undefined_replicates": iv.undefined,
+                  "significant": _significant(iv.lo, iv.hi)}
     return out
 
 
@@ -284,12 +378,21 @@ def _pick(val_run: Path, target_recall: float) -> tuple[float, float, bool]:
         raise SystemExit("Pick thresholds on val, never on test.")
     frames, _ = load_split(manifest["split"]["split"])
     preds = load_predictions(val_run)
-    triples = [(session_of(f), g, preds[f]["boxes"]) for f, g in frames if f in preds]
-    return M.choose_threshold(triples, target_recall)
+    triples = [(session_of(f), g, _clipped(f, preds[f]["boxes"])) for f, g in frames if f in preds]
+    return M.choose_threshold(triples, target_recall, manifest.get("coverage", M.DEFAULT_COVERAGE))
+
+
+def _manifest(run_dir: Path) -> dict:
+    return json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
 
 
 def _run_threshold(run_dir: Path) -> float:
-    return json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))["threshold"]
+    return _manifest(run_dir)["threshold"]
+
+
+def _run_coverage(run_dir: Path) -> float:
+    # Manifests from before coverage was recorded were all scored at the default.
+    return _manifest(run_dir).get("coverage", M.DEFAULT_COVERAGE)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -305,37 +408,65 @@ def main(argv: list[str] | None = None) -> None:
                    help="val run to pick the threshold from (uses --target-recall)")
     r.add_argument("--target-recall", type=float, default=0.95)
     r.add_argument("--allow-partial", action="store_true")
+    r.add_argument("--coverage", type=float, default=None,
+                   help=f"default: the --threshold-from run's, else {M.DEFAULT_COVERAGE}")
     s = sub.add_parser("score")
     s.add_argument("run_dir", type=Path)
-    s.add_argument("--threshold", type=float, default=None)
+    s.add_argument("--threshold", type=float, default=None,
+                   help="re-score at this threshold (written to metrics-t<X>.json); "
+                        "default: the run's own")
+    s.add_argument("--coverage", type=float, default=None,
+                   help="share of a region that must be blurred to count as protected; "
+                        "default: the run's own")
     t = sub.add_parser("pick-threshold")
     t.add_argument("run_dir", type=Path)
     t.add_argument("--target-recall", type=float, required=True)
     c = sub.add_parser("compare")
     c.add_argument("run_a", type=Path)
     c.add_argument("run_b", type=Path)
+    c.add_argument("--coverage", type=float, default=None,
+                   help="default: the runs' own (they must agree)")
     args = p.parse_args(argv)
 
     if args.cmd == "run":
         threshold, source = args.threshold, "fixed"
+        coverage = M.DEFAULT_COVERAGE if args.coverage is None else args.coverage
         if args.threshold_from:
+            # The threshold was fit for the val run's coverage; it means
+            # something else at another one.
+            val_coverage = _run_coverage(args.threshold_from)
+            if args.coverage is not None and args.coverage != val_coverage:
+                raise SystemExit(f"--coverage {args.coverage} differs from the val run's "
+                                 f"{val_coverage}; its threshold was picked for that coverage.")
+            coverage = val_coverage
             threshold, recall, met = _pick(args.threshold_from, args.target_recall)
             if not met:
                 raise SystemExit(f"Val run never reaches recall {args.target_recall} "
                                  f"(best {recall:.3f}); lower the target.")
             source = f"{args.threshold_from.name} @ target_recall={args.target_recall}"
-        out = run(build(args.system), args.split, threshold, args.allow_partial, source)
+        out = run(build(args.system), args.split, threshold, args.allow_partial, source, coverage)
         print(json.dumps(json.loads((out / "metrics.json").read_text())["metrics"], indent=2))
         print(f"Run saved to {out}")
     elif args.cmd == "score":
-        threshold = _run_threshold(args.run_dir) if args.threshold is None else args.threshold
-        print(json.dumps(score(args.run_dir, threshold), indent=2))
+        coverage = _run_coverage(args.run_dir) if args.coverage is None else args.coverage
+        own = _run_threshold(args.run_dir)
+        threshold = own if args.threshold is None else args.threshold
+        # A threshold typed by hand is recorded as such; repeating the run's own
+        # keeps the run's provenance.
+        source = None if threshold == own else "manual (score --threshold)"
+        result = score(args.run_dir, threshold, coverage, threshold_source=source)
+        print(json.dumps(result, indent=2))
     elif args.cmd == "pick-threshold":
         threshold, recall, met = _pick(args.run_dir, args.target_recall)
         print(json.dumps({"threshold": threshold, "val_recall": recall, "met": met}))
     else:
+        coverage = args.coverage
+        if coverage is None:
+            coverage = _run_coverage(args.run_a)
+            if coverage != _run_coverage(args.run_b):
+                raise SystemExit("Runs were scored at different coverage; pass --coverage.")
         result = compare(
-            args.run_a, args.run_b, _run_threshold(args.run_a), _run_threshold(args.run_b)
+            args.run_a, args.run_b, _run_threshold(args.run_a), _run_threshold(args.run_b), coverage
         )
         print(json.dumps(result, indent=2))
 
