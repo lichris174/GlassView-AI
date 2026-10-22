@@ -1,0 +1,27 @@
+[
+  {
+    "id": "econnrefused-explained",
+    "question": "A terminal shows: Error: connect ECONNREFUSED 127.0.0.1:5432. What does this mean and what is the likely fix?",
+    "contains_all": ["5432"],
+    "contains_any": ["postgres", "postgresql", "database", "not running", "refused"],
+    "not_contains": ["as an ai", "i cannot see"]
+  },
+  {
+    "id": "python-indentationerror",
+    "question": "Python raised 'IndentationError: expected an indented block after function definition on line 3'. What is wrong?",
+    "contains_any": ["indent", "indentation", "whitespace", "spaces", "tab"]
+  },
+  {
+    "id": "git-detached-head",
+    "question": "git says 'You are in detached HEAD state'. Briefly, what does that mean?",
+    "contains_any": ["commit", "branch", "not on", "detached"],
+    "not_contains": ["chain of thought", "let me think"]
+  },
+  {
+    "id": "markdown-list-format",
+    "question": "List three common HTTP status codes for client errors and what each means.",
+    "contains_all": ["404"],
+    "contains_any": ["400", "401", "403"],
+    "regex": "(?m)^\\s*[-*]\\s+|\\d+\\."
+  }
+]

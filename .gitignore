@@ -1,3 +1,34 @@
-# .gitignore: exclude build artifacts and dependency folders.
+# Dependencies
 node_modules/
-Frontend/src-tauri/target/
+
+# Rust / Tauri build artifacts
+target/
+apps/desktop/src-tauri/gen/schemas/
+
+# Frontend build
+apps/desktop/dist/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local data (chat history + memory DBs)
+*.db
+
+# Local screenshots / tool output (never commit captured screens)
+/*.png
+.playwright-mcp/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+
+# ML eval run folders (ml/evaluate.py writes results/<stamp>-<system>-<split>/)
+results/
+
+# Claude Code local config (shared .claude/ files stay trackable)
+.claude/settings.local.json
