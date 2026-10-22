@@ -7,11 +7,21 @@ here is local and read-only: the agent can look things up, never mutate state.
 
 from __future__ import annotations
 
+import asyncio
+
 from ..db import ChatStore
 from ..rag import MemoryStore
 from .registry import ToolRegistry
 
 _SNIPPET_CHARS = 300
+# Upper bounds on the size args. The model picks these values, so they are
+# clamped rather than trusted (sqlite-vec errors past k=4096).
+_MAX_RECALL_K = 10
+_MAX_CHAT_LIMIT = 20
+
+
+def _clamp(value: int | str, high: int) -> int:
+    return max(1, min(int(value), high))
 
 
 def build_registry(memory: MemoryStore, store: ChatStore) -> ToolRegistry:
@@ -23,8 +33,9 @@ def build_registry(memory: MemoryStore, store: ChatStore) -> ToolRegistry:
         'Search notes remembered from past turns. args: {"query": "<text>"} '
         "-> matching notes, most relevant first.",
     )
-    def recall_memory(query: str, k: int = 3) -> str:
-        hits = memory.query(query, k=int(k))
+    async def recall_memory(query: str, k: int = 3) -> str:
+        # Sync sqlite under the hood: keep it off the event loop.
+        hits = await asyncio.to_thread(memory.query, query, k=_clamp(k, _MAX_RECALL_K))
         if not hits:
             return "no matching memories"
         return "\n".join(
@@ -42,7 +53,7 @@ def build_registry(memory: MemoryStore, store: ChatStore) -> ToolRegistry:
             return "no chats yet"
         return "\n".join(
             f"- {c['title']} ({c['message_count']} messages, updated {c['updated_at']})"
-            for c in chats[: int(limit)]
+            for c in chats[: _clamp(limit, _MAX_CHAT_LIMIT)]
         )
 
     return registry

@@ -27,45 +27,56 @@ class AgentResult:
     stopped_reason: str = "final"
 
 
-def _extract_json_block(output: str) -> str | None:
-    """Return the first balanced JSON object literal found in ``output``."""
-    start = output.find("{")
-    if start == -1:
+# Bounds on the embedded-object scan. Model output is untrusted, and decoding at
+# every "{" of a long reply is quadratic, so only the first few candidates in
+# the first stretch of text are tried; a tool call buried past that is treated
+# as a plain answer.
+_MAX_SCAN_CHARS = 20_000
+_MAX_CANDIDATES = 32
+
+_DECODER = json.JSONDecoder()
+
+
+def _decode(text: str, start: int = 0) -> Any:
+    """Decode one JSON value at ``text[start]``, or None if there is none.
+
+    RecursionError is caught alongside ValueError: a deeply nested reply
+    ("[[[[..." ) overflows the decoder rather than failing cleanly.
+    """
+    try:
+        return _DECODER.raw_decode(text, start)[0]
+    except (ValueError, RecursionError):
         return None
-    depth = 0
-    in_string = False
-    escape = False
-    for i, ch in enumerate(output[start:], start=start):
-        if escape:
-            escape = False
-            continue
-        if ch == "\\":
-            escape = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return output[start : i + 1]
-    return None
+
+
+def _is_protocol(obj: Any) -> bool:
+    return isinstance(obj, dict) and ("tool" in obj or "final" in obj)
 
 
 def _parse(output: str) -> dict[str, Any] | None:
-    """Pull the first JSON object out of a model message, if any."""
-    block = _extract_json_block(output)
-    if block is None:
-        return None
+    """Pull the tool-call / final-answer object out of a model message, if any.
+
+    The whole reply is tried first, so a ``final`` whose text contains braces
+    parses intact. Otherwise the first embedded object carrying a ``tool`` or
+    ``final`` key wins; any other JSON (a code sample in a prose answer) is not
+    protocol, so the reply is treated as a plain answer.
+    """
     try:
-        obj = json.loads(block)
-    except json.JSONDecodeError:
-        return None
-    return obj if isinstance(obj, dict) else None
+        whole = json.loads(output.strip())
+    except (ValueError, RecursionError):
+        whole = None
+    if _is_protocol(whole):
+        return whole
+    text = output[:_MAX_SCAN_CHARS]
+    start = text.find("{")
+    for _ in range(_MAX_CANDIDATES):
+        if start == -1:
+            break
+        obj = _decode(text, start)
+        if _is_protocol(obj):
+            return obj
+        start = text.find("{", start + 1)
+    return None
 
 
 async def run_agent(
@@ -100,14 +111,28 @@ async def run_agent(
         output = await complete(transcript)
         parsed = _parse(output)
 
-        if parsed is None or "final" in parsed:
-            answer = parsed["final"] if parsed and "final" in parsed else output.strip()
-            return AgentResult(answer=answer, steps=steps)
+        if parsed is None:
+            return AgentResult(answer=output.strip(), steps=steps)
 
+        # Model output is untrusted: a malformed reply becomes an error step the
+        # model can correct, never an exception that escapes the loop.
         name = parsed.get("tool")
-        args = parsed.get("args") or {}
-        tool = registry.get(name) if isinstance(name, str) else None
-        if tool is None:
+        raw_args = parsed.get("args") or {}
+        args = raw_args if isinstance(raw_args, dict) else {}
+        # A null "final" next to a tool call is just the model filling in both
+        # keys; run the tool rather than treating it as a malformed answer.
+        if "final" in parsed and (parsed["final"] is not None or "tool" not in parsed):
+            final = parsed["final"]
+            if isinstance(final, str):
+                return AgentResult(answer=final, steps=steps)
+            if final is not None:
+                return AgentResult(answer=json.dumps(final, ensure_ascii=False), steps=steps)
+            name, observation = "final", 'error: "final" must be the answer text'
+        elif not isinstance(name, str):
+            observation = f'error: "tool" must be a tool name, got {name!r}'
+        elif not isinstance(raw_args, dict):
+            observation = 'error: "args" must be a JSON object'
+        elif (tool := registry.get(name)) is None:
             observation = f"error: unknown tool {name!r}"
         else:
             try:

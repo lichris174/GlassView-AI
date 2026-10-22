@@ -4,8 +4,9 @@ Replaces the prototype's ``past_chats.json`` + global module state. The service
 is the single writer, and every operation is scoped by ``chat_id`` so concurrent
 requests / windows cannot clobber a shared session.
 
-Images are stored on the message row as a JSON array of base64 strings. (RAG
-vectors land in a separate table in Phase 3 via sqlite-vec.)
+Images are stored on the message row as a JSON array of base64 strings. RAG
+memories live in a separate sqlite-vec database file (``<db>.memories.db``, see
+``rag.store``).
 """
 
 from __future__ import annotations
@@ -94,12 +95,13 @@ class ChatStore:
     async def create_chat(self, title: str | None = None, chat_id: str | None = None) -> dict:
         cid = chat_id or _new_id()
         now = _now()
+        clean = (title or "").strip() or "New chat"
         await self.db.execute(
             "INSERT OR IGNORE INTO chats (id, title, created_at, updated_at) VALUES (?,?,?,?)",
-            (cid, (title or "New chat").strip() or "New chat", now, now),
+            (cid, clean, now, now),
         )
         await self.db.commit()
-        return {"id": cid, "title": title or "New chat", "updated_at": now, "message_count": 0}
+        return {"id": cid, "title": clean, "updated_at": now, "message_count": 0}
 
     async def get_chat(self, chat_id: str) -> dict | None:
         row = await (await self.db.execute(
@@ -127,12 +129,15 @@ class ChatStore:
         await self.db.commit()
         return cur.rowcount > 0
 
-    async def clear_messages(self, chat_id: str) -> None:
-        await self.db.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
-        await self.db.execute(
+    async def clear_messages(self, chat_id: str) -> bool:
+        """Delete a chat's messages, keeping the chat. False if it does not exist."""
+        cur = await self.db.execute(
             "UPDATE chats SET updated_at = ? WHERE id = ?", (_now(), chat_id)
         )
+        if cur.rowcount > 0:
+            await self.db.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
         await self.db.commit()
+        return cur.rowcount > 0
 
     # --- messages ------------------------------------------------------------
     async def get_messages(self, chat_id: str) -> list[dict]:

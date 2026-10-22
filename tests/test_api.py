@@ -409,6 +409,318 @@ def test_aborted_stream_still_persists_turn(client: TestClient) -> None:
 
 def test_bodyless_post_requires_json(client: TestClient) -> None:
     """A cross-site simple POST (no preflight) cannot clear a chat."""
-    r = client.post("/chats/c1/clear", headers={"Content-Type": "text/plain"})
+    cid = client.post("/chats", json={}).json()["chat"]["id"]
+    r = client.post(f"/chats/{cid}/clear", headers={"Content-Type": "text/plain"})
     assert r.status_code == 415
-    assert client.post("/chats/c1/clear", json={}).status_code == 200
+    assert client.post(f"/chats/{cid}/clear", json={}).status_code == 200
+
+
+# --- regression tests --------------------------------------------------------
+def _png_b64() -> str:
+    """A real (tiny) PNG, base64-encoded, as the capture path would send it."""
+    import base64
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (4, 4), "white").save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _send(client: TestClient, payload: dict) -> str:
+    with client.stream("POST", "/chat", json=payload) as r:
+        return "".join(r.iter_text())
+
+
+def _capture(monkeypatch: pytest.MonkeyPatch) -> list[list[dict]]:
+    seen: list[list[dict]] = []
+
+    async def capture(self, messages, *, temperature=0.2):  # noqa: ANN001
+        seen.append(messages)
+        yield "ok"
+
+    monkeypatch.setattr(OllamaClient, "stream_chat", capture)
+    return seen
+
+
+def _recalled_chat_ids(client: TestClient, q: str) -> set[str]:
+    hits = client.get("/recall", params={"q": q, "k": 10}).json()["hits"]
+    return {h["meta"].get("chat_id") for h in hits}
+
+
+def test_deleting_a_chat_forgets_its_memories(client: TestClient) -> None:
+    _send(client, {"chat_id": "chat_del_mem", "message": "the router drops packets"})
+    _send(client, {"chat_id": "chat_keep_mem", "message": "the router reboots at night"})
+    assert "chat_del_mem" in _recalled_chat_ids(client, "router packets")
+
+    assert client.delete("/chats/chat_del_mem").status_code == 200
+    ids = _recalled_chat_ids(client, "router packets")
+    assert "chat_del_mem" not in ids
+    assert "chat_keep_mem" in ids
+
+
+def test_clearing_a_chat_forgets_its_memories(client: TestClient) -> None:
+    _send(client, {"chat_id": "chat_clear_mem", "message": "the router drops packets"})
+    assert client.post("/chats/chat_clear_mem/clear", json={}).status_code == 200
+    assert "chat_clear_mem" not in _recalled_chat_ids(client, "router packets")
+
+
+def test_failed_turns_are_not_replayed_as_history(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def boom(self, messages, *, temperature=0.2):  # noqa: ANN001
+        raise RuntimeError("model fell over")
+        yield  # pragma: no cover - makes this an async generator
+
+    monkeypatch.setattr(OllamaClient, "stream_chat", boom)
+    _send(client, {"chat_id": "chat_hist_err", "message": "first try"})
+
+    seen = _capture(monkeypatch)
+    _send(client, {"chat_id": "chat_hist_err", "message": "second try"})
+
+    sent = seen[-1]
+    assert [m["role"] for m in sent] == ["system", "user"]
+    assert "[error]" not in str(sent)
+    # The failed turn is still visible in the stored chat for the UI.
+    stored = client.get("/chats/chat_hist_err").json()["messages"]
+    assert any("[error]" in m["content"] for m in stored)
+
+
+def test_model_history_drops_failed_pairs_and_fills_empty_questions() -> None:
+    from glassview_ai.main import _model_history
+    from glassview_ai.ollama_client import EMPTY_TURN_PROMPT
+
+    rows = [
+        {"role": "user", "content": "q1", "images": ["img"]},
+        {"role": "assistant", "content": "a1", "images": []},
+        {"role": "user", "content": "q2", "images": []},
+        {"role": "assistant", "content": "[error] boom", "images": []},
+        {"role": "user", "content": "q3", "images": []},
+        {"role": "assistant", "content": "half\n\n[cancelled]", "images": []},
+        {"role": "user", "content": "q4", "images": []},
+        {"role": "assistant", "content": "[cancelled]", "images": []},
+        {"role": "user", "content": "q5", "images": []},
+        {"role": "assistant", "content": "(no response)", "images": []},
+        {"role": "user", "content": "", "images": []},
+        {"role": "assistant", "content": "a6", "images": []},
+        {"role": "user", "content": "dangling", "images": []},
+    ]
+    assert _model_history(rows) == [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": EMPTY_TURN_PROMPT},
+        {"role": "assistant", "content": "a6"},
+    ]
+
+
+def test_empty_message_turn_keeps_anthropic_alternation(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A screenshot-only follow-up must not leave a gap in the replayed roles."""
+    from glassview_ai.providers.anthropic_client import to_anthropic
+
+    cid = "chat_empty_turn"
+    _send(client, {"chat_id": cid, "message": "what is this", "image": _png_b64()})
+    _send(client, {"chat_id": cid, "message": ""})  # reuses the last image
+
+    seen = _capture(monkeypatch)
+    _send(client, {"chat_id": cid, "message": "and now?"})
+    _, msgs = to_anthropic(seen[-1])
+    assert [m["role"] for m in msgs] == ["user", "assistant"] * 2 + ["user"]
+
+
+def test_images_are_sent_once_on_the_latest_turn(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cid = "chat_img_once"
+    _send(client, {"chat_id": cid, "message": "what is this", "image": _png_b64()})
+
+    seen = _capture(monkeypatch)
+    _send(client, {"chat_id": cid, "message": "and the colour?"})
+    counts = [len(m.get("images") or []) for m in seen[-1]]
+    # system, replayed user, replayed assistant, current user (reused image).
+    assert counts == [0, 0, 0, 1]
+
+
+def test_undecodable_image_is_a_400(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import base64
+
+    import glassview_ai.ocr.fuse as ocr_fuse
+
+    monkeypatch.setattr(ocr_fuse, "tesseract_available", lambda: True)
+    bad = base64.b64encode(b"notanimage").decode("ascii")
+    r = client.post("/chat", json={"chat_id": "chat_bad_img", "message": "hi", "image": bad})
+    assert r.status_code == 400
+    assert "image" in r.json()["detail"].lower()
+
+
+def test_ocr_extract_tolerates_undecodable_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    import glassview_ai.ocr.fuse as ocr_fuse
+
+    monkeypatch.setattr(ocr_fuse, "tesseract_available", lambda: True)
+    result = ocr_fuse.extract(b"notanimage")
+    assert result.text == ""
+
+
+@pytest.mark.parametrize("k", [-1, 0, 51])
+def test_recall_rejects_out_of_range_k(client: TestClient, k: int) -> None:
+    assert client.get("/recall", params={"q": "x", "k": k}).status_code == 422
+
+
+def test_clearing_an_unknown_chat_is_a_404(client: TestClient) -> None:
+    assert client.post("/chats/nope/clear", json={}).status_code == 404
+
+
+def test_new_chat_title_is_stripped(client: TestClient) -> None:
+    chat = client.post("/chats", json={"title": "  spaced  "}).json()["chat"]
+    assert chat["title"] == "spaced"
+    blank = client.post("/chats", json={"title": "   "}).json()["chat"]
+    assert blank["title"] == "New chat"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        '{"tool": "recall_memory", "args": ["printer"]}',
+        '{"tool": "recall_memory", "args": "printer"}',
+        '{"tool": 7, "args": {}}',
+    ],
+)
+def test_agent_malformed_tool_call_is_not_a_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, reply: str
+) -> None:
+    replies = iter([reply, '{"final": "done"}'])
+
+    async def scripted(self, messages, *, temperature=0.2):  # noqa: ANN001
+        yield next(replies)
+
+    monkeypatch.setattr(OllamaClient, "stream_chat", scripted)
+    r = client.post("/agent", json={"question": "q"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["answer"] == "done"
+    assert body["steps"][0]["observation"].startswith("error:")
+
+
+@pytest.mark.parametrize(("final", "expected"), [("123", "123"), ('{"a": 1}', '{"a": 1}')])
+def test_agent_non_string_final_is_not_a_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, final: str, expected: str
+) -> None:
+    async def scripted(self, messages, *, temperature=0.2):  # noqa: ANN001
+        yield '{"final": ' + final + "}"
+
+    monkeypatch.setattr(OllamaClient, "stream_chat", scripted)
+    r = client.post("/agent", json={"question": "q"})
+    assert r.status_code == 200
+    assert r.json()["answer"] == expected
+
+
+def test_blocking_work_runs_off_the_event_loop(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OCR and the sync sqlite memory calls must not stall the event loop."""
+    import threading
+
+    import glassview_ai.main as main_mod
+    from glassview_ai.ocr import OcrResult
+    from glassview_ai.rag import MemoryStore
+
+    threads: dict[str, int] = {}
+
+    def fake_ocr(raw: bytes) -> OcrResult:
+        threads["ocr"] = threading.get_ident()
+        return OcrResult(text="", available=True)
+
+    real_query, real_add = MemoryStore.query, MemoryStore.add
+
+    def query(self, *a, **k):  # noqa: ANN001, ANN002, ANN003
+        threads["query"] = threading.get_ident()
+        return real_query(self, *a, **k)
+
+    def add(self, *a, **k):  # noqa: ANN001, ANN002, ANN003
+        threads["add"] = threading.get_ident()
+        return real_add(self, *a, **k)
+
+    async def stream(self, messages, *, temperature=0.2):  # noqa: ANN001
+        threads["loop"] = threading.get_ident()
+        yield "ok"
+
+    monkeypatch.setattr(main_mod, "ocr_extract", fake_ocr)
+    monkeypatch.setattr(MemoryStore, "query", query)
+    monkeypatch.setattr(MemoryStore, "add", add)
+    monkeypatch.setattr(OllamaClient, "stream_chat", stream)
+
+    _send(client, {"chat_id": "chat_threads", "message": "hello there", "image": _png_b64()})
+    assert {"ocr", "query", "add", "loop"} <= threads.keys()
+    for name in ("ocr", "query", "add"):
+        assert threads[name] != threads["loop"], name
+
+
+def test_truncated_jpeg_is_a_400(client: TestClient) -> None:
+    """verify() passes a cut-off JPEG; only a real decode catches it."""
+    import base64
+    import io
+    import random
+
+    from PIL import Image
+
+    rng = random.Random(0)
+    img = Image.new("RGB", (64, 64))
+    img.putdata([tuple(rng.randrange(256) for _ in range(3)) for _ in range(64 * 64)])
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    half = buf.getvalue()[: len(buf.getvalue()) // 2]
+    b64 = base64.b64encode(half).decode("ascii")
+    r = client.post("/chat", json={"chat_id": "chat_trunc", "message": "hi", "image": b64})
+    assert r.status_code == 400
+
+
+def test_unreadable_stored_image_is_not_reused(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A legacy row holding a broken image must not be sent to the model."""
+    import base64
+    import functools
+
+    from glassview_ai.main import app
+
+    bad = base64.b64encode(b"notanimage").decode("ascii")
+    client.portal.call(functools.partial(
+        app.state.store.add_message, "chat_legacy", "user", "old", images=[bad]
+    ))
+    client.portal.call(app.state.store.add_message, "chat_legacy", "assistant", "old answer")
+
+    seen = _capture(monkeypatch)
+    _send(client, {"chat_id": "chat_legacy", "message": "again"})
+    assert not any(m.get("images") for m in seen[-1])
+
+
+@pytest.mark.parametrize("action", ["delete", "clear"])
+def test_stream_finishing_after_delete_does_not_resurrect_the_chat(
+    client: TestClient, action: str
+) -> None:
+    from glassview_ai import main as main_mod
+    from glassview_ai.schemas import ChatRequest
+
+    cid = f"chat_race_{action}"
+
+    async def run() -> None:
+        resp = await main_mod.chat(ChatRequest(chat_id=cid, message="router drops packets"))
+        gen = resp.body_iterator
+        assert await gen.__anext__() == b"Hello"
+        if action == "delete":
+            await main_mod.delete_chat(cid)
+        else:
+            await main_mod.clear_chat(cid)
+        async for _ in gen:
+            pass
+
+    client.portal.call(run)
+    assert cid not in _recalled_chat_ids(client, "router packets")
+    if action == "delete":
+        assert client.get(f"/chats/{cid}").status_code == 404
+    else:
+        assert client.get(f"/chats/{cid}").json()["messages"] == []

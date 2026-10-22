@@ -23,21 +23,26 @@ from .base import MissingApiKeyError, media_type
 DEFAULT_MODEL = "gpt-4o-mini"  # vision-capable and cheap; override per request
 BASE_URL = "https://api.openai.com/v1/chat/completions"
 
-# DeepSeek: OpenAI-compatible endpoint. deepseek-chat is text-only, so an image
-# turn reaches it as text and the model simply answers without seeing the image.
+# DeepSeek: OpenAI-compatible endpoint. deepseek-chat is text-only, so images are
+# dropped (see ``vision``) and an image turn reaches it as its text alone; the
+# model answers without seeing the image.
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1/chat/completions"
 DEEPSEEK_DEFAULT_MODEL = "deepseek-chat"
 
 
-def to_openai(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def to_openai(
+    messages: list[dict[str, Any]], *, vision: bool = True
+) -> list[dict[str, Any]]:
     """Convert internal messages to OpenAI chat-completions format.
 
     Text-only turns keep a plain string ``content``; turns with an image use the
     multipart array with a ``data:`` URL, which is what the vision models expect.
+    With ``vision=False`` images are dropped so a text-only model is never sent
+    an ``image_url`` part it would reject.
     """
     out: list[dict[str, Any]] = []
     for m in messages:
-        images = m.get("images") or []
+        images = (m.get("images") or []) if vision else []
         if not images:
             out.append({"role": m["role"], "content": m.get("content", "")})
             continue
@@ -59,6 +64,7 @@ class OpenAICompatibleClient:
     """Any backend that speaks OpenAI chat-completions."""
 
     label = "OpenAI"
+    vision = True  # whether the default model accepts image parts
 
     def __init__(
         self,
@@ -81,7 +87,7 @@ class OpenAICompatibleClient:
     ) -> AsyncIterator[str]:
         payload = {
             "model": self.model,
-            "messages": to_openai(messages),
+            "messages": to_openai(messages, vision=self.vision),
             "stream": True,
             "temperature": temperature,
         }
@@ -119,6 +125,7 @@ class OpenAIClient(OpenAICompatibleClient):
 
 class DeepSeekClient(OpenAICompatibleClient):
     label = "DeepSeek"
+    vision = False
 
     def __init__(self, api_key: str | None, model: str | None = None) -> None:
         super().__init__(

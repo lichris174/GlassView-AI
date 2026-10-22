@@ -8,6 +8,10 @@ from typing import Any
 
 import httpx
 
+# What the model is asked when the user sends a screenshot with no text. Also
+# used when replaying such a turn as history, so the two always agree.
+EMPTY_TURN_PROMPT = "Describe this screenshot briefly."
+
 
 def _strip_data_url(image: str) -> str:
     """Accept a data URL or bare base64; return bare base64."""
@@ -30,7 +34,7 @@ def build_messages(
 
     user: dict[str, Any] = {
         "role": "user",
-        "content": (user_message or "").strip() or "Describe this screenshot briefly.",
+        "content": (user_message or "").strip() or EMPTY_TURN_PROMPT,
     }
     if image:
         user["images"] = [_strip_data_url(image)]

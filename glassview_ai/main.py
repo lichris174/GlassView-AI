@@ -8,10 +8,11 @@ module-level conversation for the whole process).
 from __future__ import annotations
 
 import asyncio
+import collections
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import StreamingResponse
@@ -22,7 +23,7 @@ from .agents.tools import build_registry
 from .db import ChatStore
 from .ocr import extract as ocr_extract
 from .ocr import fuse_prompt
-from .ollama_client import OllamaClient, build_messages
+from .ollama_client import EMPTY_TURN_PROMPT, OllamaClient, build_messages
 from .providers import PROVIDERS, MissingApiKeyError, build_client, detect_provider
 from .rag import HashEmbedder, MemoryStore, fuse_recall, select_hits
 from .routing import RoutePolicy, route
@@ -40,6 +41,14 @@ from .schemas import (
 # How many raw memory hits to pull before filtering; select_hits trims to the few
 # that clear the distance cut and are not from the current chat.
 RECALL_CANDIDATES = 10
+
+# How a turn that did not complete is stored. The UI shows these as-is, but they
+# are not real answers, so _model_history never replays them to the model.
+# Recognising them by text is a stopgap: a status column on messages would be
+# exact, but needs a schema migration the store does not have yet.
+ERROR_PREFIX = "[error] "
+CANCELLED_MARK = "[cancelled]"
+NO_RESPONSE = "(no response)"
 
 
 @asynccontextmanager
@@ -60,6 +69,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     # Tools the agent loop may call. Read-only and local; see agents/tools.py.
     app.state.tools = build_registry(app.state.memory, store)
+    # Bumped whenever a chat is deleted or cleared, so a /chat stream that was
+    # already running can tell its turn no longer belongs in that chat.
+    app.state.chat_epochs = collections.Counter()
     try:
         yield
     finally:
@@ -156,10 +168,18 @@ async def rename_chat(chat_id: str, req: RenameRequest) -> dict:
     return {"ok": True}
 
 
+async def _forget_chat(chat_id: str) -> None:
+    """Drop a chat's memories so its turns stop surfacing in recall elsewhere."""
+    memory: MemoryStore = app.state.memory
+    app.state.chat_epochs[chat_id] += 1
+    await asyncio.to_thread(memory.delete_by_chat, chat_id)
+
+
 @app.delete("/chats/{chat_id}")
 async def delete_chat(chat_id: str) -> dict:
     if not await _store(app).delete_chat(chat_id):
         raise HTTPException(status_code=404, detail="Chat not found")
+    await _forget_chat(chat_id)
     return {"ok": True}
 
 
@@ -176,20 +196,67 @@ def require_json(request: Request) -> None:
 
 @app.post("/chats/{chat_id}/clear", dependencies=[Depends(require_json)])
 async def clear_chat(chat_id: str) -> dict:
-    await _store(app).clear_messages(chat_id)
+    if not await _store(app).clear_messages(chat_id):
+        raise HTTPException(status_code=404, detail="Chat not found")
+    await _forget_chat(chat_id)
     return {"ok": True}
 
 
 # --- streaming chat ----------------------------------------------------------
 def _image_bytes(image: str) -> bytes | None:
-    """Decode a data URL or bare base64 image to raw bytes, or None on failure."""
+    """Decode a data URL or bare base64 image to raw bytes, or None when it is
+    not base64 or not an image Pillow can fully decode.
+
+    ``load()`` rather than ``verify()``: verify only checks headers and passes a
+    truncated JPEG that would then fail at the model or in OCR.
+    """
     import base64
+    import io
+
+    from PIL import Image
 
     try:
         b64 = image.split(",", 1)[1] if "," in image else image
-        return base64.b64decode(b64)
-    except Exception:  # noqa: BLE001 - a bad image just disables OCR for this turn
+        raw = base64.b64decode(b64)
+        Image.open(io.BytesIO(raw)).load()
+    except Exception:  # noqa: BLE001 - any decode failure means "not an image"
         return None
+    return raw
+
+
+def _failed_answer(answer: str) -> bool:
+    return (
+        answer.startswith(ERROR_PREFIX)
+        or answer.endswith(CANCELLED_MARK)
+        or answer == NO_RESPONSE
+    )
+
+
+def _model_history(rows: list[dict]) -> list[dict]:
+    """Turn stored rows into the history replayed to the model.
+
+    Only complete user/assistant pairs are kept, so roles strictly alternate
+    (Anthropic needs that). A pair whose answer failed, was cancelled, or was
+    empty is dropped: the UI still shows it, but the model should not learn from
+    it. An empty question is replayed as what the model was actually asked.
+    Images are stripped: the current turn carries the one image that applies,
+    so history never resends screenshots.
+    """
+    turns: list[dict] = []
+    i = 0
+    while i < len(rows) - 1:
+        question, answer = rows[i], rows[i + 1]
+        if question["role"] != "user" or answer["role"] != "assistant":
+            i += 1
+            continue
+        if not _failed_answer(answer["content"]):
+            turns.append({
+                "role": "user",
+                "content": (question["content"] or "").strip() or EMPTY_TURN_PROMPT,
+            })
+            turns.append({"role": "assistant", "content": answer["content"]})
+        i += 2
+    return turns[-config.MAX_HISTORY_TURNS * 2:]
 
 
 @app.post("/chat")
@@ -197,27 +264,39 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     store = _store(app)
     memory: MemoryStore = app.state.memory
 
+    # Reject an unreadable new image up front, while an HTTP error can still be
+    # returned; once streaming starts the status is already 200. Decoding runs
+    # in a thread because a full screenshot is a few MB.
+    raw = await asyncio.to_thread(_image_bytes, req.image) if req.image else None
+    if req.image and raw is None:
+        raise HTTPException(status_code=400, detail="Image could not be decoded")
+
     await store.create_chat(chat_id=req.chat_id)  # idempotent
-    history = (await store.get_messages(req.chat_id))[-config.MAX_HISTORY_TURNS * 2:]
+    epoch = app.state.chat_epochs[req.chat_id]
+    history = _model_history(await store.get_messages(req.chat_id))
 
     # A new image resets the visual context for this chat; otherwise reuse last.
     image = req.image or await store.last_image(req.chat_id)
+    if image and raw is None:
+        raw = await asyncio.to_thread(_image_bytes, image)
+        if raw is None:
+            # A stored image from before decoding was checked; never send it.
+            image = None
 
     # OCR fusion: fold any on-screen text into the prompt (no-op without Tesseract
     # or without an image). The stored user message stays the original question.
+    # Tesseract is a blocking subprocess, so it runs off the event loop.
     prompt = req.message
-    if image:
-        raw = _image_bytes(image)
-        if raw is not None:
-            ocr = ocr_extract(raw)
-            prompt = fuse_prompt(req.message, ocr.text)
+    if raw is not None:
+        ocr = await asyncio.to_thread(ocr_extract, raw)
+        prompt = fuse_prompt(req.message, ocr.text)
 
     # Recall fusion: fold in relevant notes from *other* chats. This chat's own
     # turns are already replayed as history, so they are excluded to avoid both
     # wasted context and the model parroting its previous answer back.
     if req.recall and req.message.strip():
         hits = select_hits(
-            memory.query(req.message, k=RECALL_CANDIDATES),
+            await asyncio.to_thread(memory.query, req.message, k=RECALL_CANDIDATES),
             req.message,
             exclude_chat_id=req.chat_id,
         )
@@ -258,6 +337,11 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     messages = build_messages(config.SYSTEM_PROMPT, history, prompt, image)
 
     async def persist(answer: str, remember: bool) -> None:
+        # The chat may have been deleted or cleared while this answer streamed.
+        # Writing anyway would recreate it (add_message upserts the chat) or
+        # refill it, and re-add a memory the user just asked to forget.
+        if app.state.chat_epochs[req.chat_id] != epoch:
+            return
         # Store the image only on the message that introduced it.
         await store.add_message(
             req.chat_id, "user", req.message or "",
@@ -266,8 +350,9 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         await store.add_message(req.chat_id, "assistant", answer)
         # Remember successful turns for later recall; redaction happens inside
         # the store. Failed or cancelled turns are not worth recalling.
-        if remember:
-            memory.add(
+        if remember and app.state.chat_epochs[req.chat_id] == epoch:
+            await asyncio.to_thread(
+                memory.add,
                 f"Q: {req.message}\nA: {answer}",
                 meta={"chat_id": req.chat_id, "model": chosen_model},
                 redact_text=req.redact,
@@ -291,7 +376,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             # The 200 header is already sent, so a raised error would otherwise
             # reach the client as a silent empty body. Surface it in the stream
             # instead, and record it so the failed turn is not lost.
-            error = f"[error] {exc}"
+            error = f"{ERROR_PREFIX}{exc}"
             yield error.encode("utf-8")
         finally:
             partial = "".join(answer_parts)
@@ -300,9 +385,9 @@ async def chat(req: ChatRequest) -> StreamingResponse:
                 # what the user saw.
                 answer = error
             elif cancelled:
-                answer = f"{partial}\n\n[cancelled]" if partial else "[cancelled]"
+                answer = f"{partial}\n\n{CANCELLED_MARK}" if partial else CANCELLED_MARK
             else:
-                answer = partial or "(no response)"
+                answer = partial or NO_RESPONSE
             ok = error is None and not cancelled and bool(answer_parts)
             # Shielded: on a client abort this task is being cancelled, and an
             # unshielded await here would drop the turn from history.
@@ -356,10 +441,10 @@ async def agent(req: AgentRequest) -> AgentResponse:
 
 # --- memory recall -----------------------------------------------------------
 @app.get("/recall")
-async def recall(q: str, k: int = 5) -> dict:
+async def recall(q: str, k: int = Query(5, ge=1, le=50)) -> dict:
     """Semantic search over remembered turns ("what was that error yesterday")."""
     memory: MemoryStore = app.state.memory
-    hits = memory.query(q, k=k)
+    hits = await asyncio.to_thread(memory.query, q, k=k)
     return {
         "hits": [
             {"text": h.text, "distance": h.distance, "meta": h.meta,

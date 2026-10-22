@@ -21,8 +21,9 @@ DEFAULT_DB_PATH = os.path.join(
 # Env is read at call time (see load_settings / detect_model) so that tests and
 # the launcher can set GLASSVIEW_DB / OLLAMA_HOST before values are resolved.
 
-# Preference order when several vision tags are installed. We prefer instruct
-# tunes, then any qwen3-vl, then any model the user explicitly named.
+# Vision families to auto-pick, in preference order, when no model is named via
+# OLLAMA_MODEL (an installed override always wins). Within a family an instruct
+# tune is preferred over any other tag.
 _VISION_PREFERENCES = ("qwen3-vl",)
 
 MAX_HISTORY_TURNS = 12  # user/assistant pairs kept as rolling context

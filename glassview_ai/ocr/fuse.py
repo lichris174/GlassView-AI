@@ -32,14 +32,18 @@ def tesseract_available() -> bool:
 
 
 def extract(image: bytes) -> OcrResult:
-    """Run OCR over PNG/JPEG bytes; empty result if Tesseract is unavailable."""
+    """Run OCR over PNG/JPEG bytes; empty if Tesseract is unavailable or the
+    bytes are not a readable image."""
     if not tesseract_available():
         return OcrResult(text="", available=False)
     import pytesseract
     from PIL import Image
 
-    img = Image.open(io.BytesIO(image))
-    text = pytesseract.image_to_string(img).strip()
+    try:
+        img = Image.open(io.BytesIO(image))
+        text = pytesseract.image_to_string(img).strip()
+    except Exception:  # noqa: BLE001 - unreadable image: skip OCR, do not fail the turn
+        return OcrResult(text="", available=True)
     return OcrResult(text=text[:_MAX_OCR_CHARS], available=True)
 
 

@@ -131,3 +131,39 @@ def test_anthropic_client_ignores_temperature_signature() -> None:
     src = inspect.getsource(AnthropicClient.stream_chat)
     assert "del temperature" in src
     assert "temperature=temperature" not in src
+
+
+async def _sent_payload(client, monkeypatch: pytest.MonkeyPatch) -> dict:  # noqa: ANN001
+    """Run ``stream_chat`` against a mock transport; return the JSON it POSTed."""
+    import json
+
+    import httpx
+
+    sent: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.update(json.loads(request.content))
+        body = 'data: {"choices": [{"delta": {"content": "ok"}}]}\n\ndata: [DONE]\n\n'
+        return httpx.Response(200, text=body)
+
+    real = httpx.AsyncClient
+
+    def mocked(*a, **k):  # noqa: ANN002, ANN003
+        return real(*a, transport=httpx.MockTransport(handler), **k)
+
+    monkeypatch.setattr(httpx, "AsyncClient", mocked)
+    chunks = [c async for c in client.stream_chat(_messages())]
+    assert chunks == ["ok"]
+    return sent
+
+
+async def test_deepseek_is_sent_text_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """deepseek-chat is text-only: image parts must never reach its API."""
+    payload = await _sent_payload(DeepSeekClient("sk-x"), monkeypatch)
+    assert "image_url" not in str(payload)
+    assert payload["messages"][1] == {"role": "user", "content": "what is this"}
+
+
+async def test_openai_still_receives_images(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = await _sent_payload(OpenAIClient("sk-x"), monkeypatch)
+    assert payload["messages"][1]["content"][0]["type"] == "image_url"

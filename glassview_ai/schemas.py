@@ -12,21 +12,6 @@ class ChatSummary(BaseModel):
     message_count: int = 0
 
 
-class Message(BaseModel):
-    role: str
-    content: str
-    # base64 image payloads (data URL or bare base64); empty for text-only turns
-    images: list[str] = Field(default_factory=list)
-
-
-class ChatDetail(BaseModel):
-    id: str
-    title: str
-    created_at: str | None = None
-    updated_at: str | None = None
-    messages: list[Message] = Field(default_factory=list)
-
-
 class NewChatRequest(BaseModel):
     title: str | None = None
 

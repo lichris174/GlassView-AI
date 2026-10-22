@@ -32,3 +32,24 @@ def test_meta_round_trips() -> None:
     hit = store.query("build failure", k=1)[0]
     assert hit.meta["chat_id"] == "c1"
     store.close()
+
+
+def test_delete_by_chat_removes_only_that_chats_memories() -> None:
+    store = MemoryStore()
+    store.add("router drops packets", meta={"chat_id": "a"})
+    store.add("router drops packets again", meta={"chat_id": "a"})
+    store.add("router reboots at night", meta={"chat_id": "b"})
+    store.add("router note without a chat")
+
+    assert store.delete_by_chat("a") == 2
+    chats = {h.meta.get("chat_id") for h in store.query("router", k=10)}
+    assert chats == {"b", None}
+    assert store.delete_by_chat("a") == 0
+    store.close()
+
+
+def test_delete_by_chat_matches_non_string_ids() -> None:
+    store = MemoryStore()
+    store.add("router drops packets", meta={"chat_id": 123})
+    assert store.delete_by_chat("123") == 1
+    store.close()

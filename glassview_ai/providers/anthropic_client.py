@@ -17,7 +17,7 @@ from typing import Any
 
 from .base import MissingApiKeyError, media_type, split_system
 
-# Anthropic's current flagship. Overridable per-request via ChatRequest.model.
+# Default Anthropic model. Overridable per-request via ChatRequest.model.
 DEFAULT_MODEL = "claude-opus-5"
 
 # Generous ceiling, not a target: it caps a runaway answer without truncating a
