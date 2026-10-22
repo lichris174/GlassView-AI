@@ -14,7 +14,7 @@ from ml import evaluate as E
 from ml import metrics as M
 from ml.baselines.ocr_regex import boxes_from_ocr
 from ml.baselines.qwen_vl import parse_boxes
-from ml.labels import Box, import_yolo_export, parse_yolo, to_yolo
+from ml.labels import Box, import_json_export, import_yolo_export, parse_yolo, to_yolo
 
 
 def B(x1: float, y1: float, x2: float, y2: float, cls: str = "api_key", score: float = 1.0) -> Box:
@@ -241,6 +241,29 @@ def test_import_writes_empty_label_for_image_without_boxes(tmp_path: Path) -> No
     n, _ = import_yolo_export(export, raw, dest)
     label = dest / "clean-01" / "20261014-111111-002.txt"
     assert n == 1 and label.read_text() == ""
+
+
+def test_json_import_converts_boxes_and_handles_clean_and_skipped(tmp_path: Path) -> None:
+    raw, dest = tmp_path / "raw", tmp_path / "labels"
+    (raw / "s1").mkdir(parents=True)
+    for stem in ("20261020-000001-001", "20261020-000002-002", "20261020-000003-003"):
+        Image.new("RGB", (10, 10)).save(raw / "s1" / f"{stem}.png")
+    box = {"value": {"x": 10, "y": 20, "width": 40, "height": 10,
+                     "rectanglelabels": ["financial"]}}
+    tasks = [
+        {"data": {"image": "/data/upload/4/ab12-s1__20261020-000001-001.png"},
+         "annotations": [{"was_cancelled": False, "result": [box]}]},
+        {"data": {"image": "/data/upload/4/cd34-s1__20261020-000002-002.png"},
+         "annotations": [{"was_cancelled": False, "result": []}]},
+        {"data": {"image": "/data/upload/4/ef56-s1__20261020-000003-003.png"},
+         "annotations": [{"was_cancelled": True, "result": []}]},
+    ]
+    n, problems = import_json_export(tasks, raw, dest)
+    assert n == 2 and len(problems) == 1 and "skipped" in problems[0]
+    expected = "2 0.300000 0.250000 0.400000 0.100000\n"
+    assert (dest / "s1" / "20261020-000001-001.txt").read_text() == expected
+    assert (dest / "s1" / "20261020-000002-002.txt").read_text() == ""
+    assert not (dest / "s1" / "20261020-000003-003.txt").exists()
 
 
 # --- end to end --------------------------------------------------------------

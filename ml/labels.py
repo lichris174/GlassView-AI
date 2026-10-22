@@ -12,6 +12,7 @@ false-blur rate be measured.
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -140,14 +141,54 @@ def import_yolo_export(export_dir: Path, raw: Path, dest: Path) -> tuple[int, li
     return imported, problems
 
 
+def import_json_export(tasks: list[dict], raw: Path, dest: Path) -> tuple[int, list[str]]:
+    """Write labels from a Label Studio JSON export (``label-studio export <id> JSON``).
+
+    JSON needs no image download, unlike the YOLO export. Boxes are stored as
+    percentages of the image with a top-left origin. A submitted annotation with
+    no boxes becomes an empty label file (clean frame). A skipped (cancelled)
+    annotation writes nothing, so the frame stays "not labeled yet".
+    """
+    frames = sorted(raw.glob("*/*.png"))
+    imported, problems = 0, []
+    for task in tasks:
+        name = Path(task["data"]["image"]).stem
+        match = [f for f in frames if name.endswith(f.stem)]
+        if len(match) != 1:
+            problems.append(f"{name}: {'no' if not match else 'ambiguous'} frame match")
+            continue
+        done = [a for a in task.get("annotations", []) if not a.get("was_cancelled")]
+        if not done:
+            problems.append(f"{match[0].parent.name}/{match[0].name}: skipped, not labeled")
+            continue
+        lines = []
+        for r in done[-1]["result"]:
+            v = r.get("value", {})
+            for cls in v.get("rectanglelabels", []):
+                if cls not in CLASSES:
+                    raise SystemExit(f"Unknown class {cls!r} in {name}")
+                w, h = v["width"] / 100, v["height"] / 100
+                cx, cy = v["x"] / 100 + w / 2, v["y"] / 100 + h / 2
+                lines.append(f"{CLASSES.index(cls)} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+        target = dest / match[0].parent.name / f"{match[0].stem}.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        imported += 1
+    return imported, problems
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description="Label utilities.")
     sub = p.add_subparsers(dest="cmd", required=True)
-    imp = sub.add_parser("import", help="import a Label Studio YOLO export")
-    imp.add_argument("export_dir", type=Path)
+    imp = sub.add_parser("import", help="import a Label Studio YOLO export dir or JSON file")
+    imp.add_argument("export", type=Path)
     args = p.parse_args(argv)
 
-    n, problems = import_yolo_export(args.export_dir, raw_dir(), labels_dir())
+    if args.export.suffix == ".json":
+        tasks = json.loads(args.export.read_text(encoding="utf-8"))
+        n, problems = import_json_export(tasks, raw_dir(), labels_dir())
+    else:
+        n, problems = import_yolo_export(args.export, raw_dir(), labels_dir())
     print(f"Imported {n} label file(s) into {labels_dir()}")
     for line in problems:
         print(f"  ! {line}")
