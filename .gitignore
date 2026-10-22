@@ -26,3 +26,9 @@ __pycache__/
 # Editor / OS
 .DS_Store
 Thumbs.db
+
+# ML eval run folders (ml/evaluate.py writes results/<stamp>-<system>-<split>/)
+results/
+
+# Claude Code local config (shared .claude/ files stay trackable)
+.claude/settings.local.json

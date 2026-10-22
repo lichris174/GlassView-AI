@@ -1,3 +1,5 @@
+> **Historical (2026-06), superseded by [README.md](../README.md) and [DEVLOG.md](DEVLOG.md) as of 2026-10-22.** Kept for reference; this voice plan was never implemented (no `/transcribe` route, no `useVoice` hook) and is not on the current roadmap.
+
 # Phase 4 - Voice + polish (plan)
 
 Goal: local push-to-talk voice into the same chat path, plus the UX polish that

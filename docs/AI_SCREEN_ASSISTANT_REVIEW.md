@@ -1,3 +1,5 @@
+> **Historical (2026-06), superseded by [README.md](../README.md) and [DEVLOG.md](DEVLOG.md) as of 2026-10-22.** Kept for reference; paths, test counts, and file references (e.g. `VoicePanel.tsx`, removed in `2cf84ae`) are out of date.
+
 # GlassView AI / AI Screen Assistant — Review Progress & Bug Audit
 
 **Reviewed:** 2026-06-26

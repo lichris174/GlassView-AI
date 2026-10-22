@@ -7,9 +7,18 @@ captured.
 
 ## 0. Setup (5 min)
 
+Install the ML extras once: `./setup.ps1 -ML` (or `pip install -r requirements-ml.txt` and
+`python -m playwright install chromium`).
+
+**Dataset location.** Everything below lives under `GLASSVIEW_DATA` (on the main dev machine:
+`D:\GlassView\dataset`). If the variable is not set *in the current shell*, `ml/paths.py` silently
+falls back to `%LOCALAPPDATA%\GlassView\dataset`, which on that machine is a stale copy with **no
+labels**. A shell or IDE opened before the variable was set will not see it, so check first:
+
 ```powershell
-.venv\Scripts\python -m ml.synth.kit          # fake content -> %LOCALAPPDATA%\GlassView\dataset\kit
-explorer $env:LOCALAPPDATA\GlassView\dataset\kit
+$env:GLASSVIEW_DATA                           # must print the dataset path
+.venv\Scripts\python -m ml.synth.kit          # fake content -> $env:GLASSVIEW_DATA\kit
+explorer $env:GLASSVIEW_DATA\kit
 ```
 
 Before every session: close or minimize anything personal (real chats, email, banking). Capture
@@ -41,22 +50,27 @@ then press **Ctrl+C**. Similar frames are skipped automatically, so keep things 
 | 13 | `clean-browsing` | Docs, Wikipedia, YouTube home, news, a shopping page with prices | (clean) |
 | 14 | `mixed-split` | Snap two windows side by side (Win+←/→): `.env` + browser, chat + docs, Excel + email draft | several |
 
-Target: **150–200 frames** total. Check with `dir $env:LOCALAPPDATA\GlassView\dataset\raw\*`.
+Target: **150–200 frames** total. Check with `dir $env:GLASSVIEW_DATA\raw\*`. (The first round actually
+produced **108 frames from 9 sessions**; see DEVLOG 2026-10-20.)
 
 ## 2. Review (5 min)
 
-Flip through `%LOCALAPPDATA%\GlassView\dataset\raw\<session>\` and delete any frame showing
+Flip through `$env:GLASSVIEW_DATA\raw\<session>\` and delete any frame showing
 something real (a notification popup, your real inbox). Deleting is safe until step 3.
 
 ## 3. Freeze the split (1 min)
 
 ```powershell
-.venv\Scripts\python -m ml.splits assign --test-frac 0.55 --val-frac 0.30
+.venv\Scripts\python -m ml.splits assign --test-frac 0.55 --val-frac 0.30 --seed 5
 ```
 
+`make split` runs the same command. These are not `ml/splits.py`'s own defaults (0.35 / 0.15,
+seed 0), so always pass them.
+
 Real frames are mostly for evaluation: ~55% test, ~30% val (picks the confidence threshold),
-~15% train (lets an ablation measure how much a little real data helps). After this, test frames
-are never edited.
+~15% train (lets an ablation measure how much a little real data helps). Splits are whole
+sessions, so the result only approximates these targets: the frozen split is 63 test / 35 val /
+10 train frames (58% / 32% / 9%). After this, test frames are never edited.
 
 ## 4. Label in Label Studio (60–90 min)
 
@@ -83,13 +97,15 @@ label-studio start        # opens http://localhost:8080
 3. For each frame: press **1–5**, drag a box, repeat; press **Submit** even when there is nothing
    to box (that records "clean"). Rules: `docs/LABELING_GUIDE.md`. Box only the secret value,
    one box per run of messages, nothing for empty forms or prices.
-4. **Export → YOLO** and unzip, then:
+4. **Export → JSON** (Label Studio's own format; preferred), then:
 
    ```powershell
-   .venv\Scripts\python -m ml.labels import <unzipped-export-folder>
+   .venv\Scripts\python -m ml.labels import <export>.json
    ```
 
-   Class order and Label Studio's renamed files are handled automatically.
+   A **YOLO** export still works: unzip it and pass the folder instead of the `.json` file.
+   Class order and Label Studio's renamed files are handled automatically. Importing overwrites
+   existing label files, including any hand-fixed test labels, so never re-import an export made before those fixes.
 
 ## 5. Done
 

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    # Windows matches the dev machine (ml.capture uses Win32 APIs, sqlite-vec
+    # loads as a SQLite extension). Tesseract and Ollama are not installed; the
+    # tests that touch them skip or fake them.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+            requirements-ml.txt
+      # ML extras too: tests/test_ml_synth.py imports faker. Playwright's browsers
+      # are not downloaded; no test renders a page.
+      - run: python -m pip install -r requirements-dev.txt -r requirements-ml.txt
+      - run: python -m ruff check glassview_ai ml tests
+      - run: python -m pytest -q
+
+  desktop:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit

@@ -13,8 +13,11 @@ and changed only with a dated note at the bottom.
   session, and stop it (Ctrl+C) before switching to anything personal.
 - **Review before labeling.** Delete any frame that shows something real by accident. Deleting is
   always safe before the split is frozen.
-- **Data stays local.** Frames are saved under `%LOCALAPPDATA%\GlassView\dataset`, outside the repo
-  and outside OneDrive. Only metrics and a few hand-checked, fully fake examples are ever published.
+- **Data stays local.** Frames are saved under `GLASSVIEW_DATA` (on the main dev machine
+  `D:\GlassView\dataset`), outside the repo and outside OneDrive. If that variable is not set in
+  the current shell, `ml/paths.py` silently falls back to `%LOCALAPPDATA%\GlassView\dataset`,
+  which there is a stale copy with no labels; check `$env:GLASSVIEW_DATA` before running anything.
+  Only metrics and a few hand-checked, fully fake examples are ever published.
 
 ## 2. Classes
 
@@ -66,16 +69,21 @@ per session (see `ml/splits.py`), so variety *between* sessions matters more tha
 
 Vary themes (light and dark), zoom levels, window sizes, and apps within each theme.
 
-**Target:** ~300 labeled frames from at least 15 sessions. About 35% are frozen as test before any
-model is trained.
+**Target:** ~300 labeled frames from at least 15 sessions (the first-round checklist in
+`docs/COLLECTING.md` aims lower, at 150-200). **Actual so far:** 108 frames from 9 sessions. The
+split was frozen with `--test-frac 0.55 --val-frac 0.30 --seed 5` (`make split`), giving 63 test /
+35 val / 10 train frames (58% / 32% / 9%), before any model is trained. Real frames are mostly for
+evaluation because training data is synthetic.
 
 ## 5. Labeling workflow
 
 1. Capture sessions, then review and delete accidental real content.
-2. Freeze the split: `python -m ml.splits assign`. From this point test frames are never edited.
-   `python -m ml.splits verify` checks it.
+2. Freeze the split: `make split` (= `python -m ml.splits assign --test-frac 0.55 --val-frac 0.30
+   --seed 5`; the script's bare defaults differ). From this point test frames are never edited.
+   `python -m ml.splits verify` (`make verify-split`) checks it.
 3. Label in [Label Studio](https://labelstud.io) (local, `pip install label-studio`) using the five
-   classes above, and export in YOLO format.
+   classes above. Export as **Label Studio JSON** and run `python -m ml.labels import <export>.json`;
+   a YOLO export folder is still accepted.
 4. **Consistency check:** a week after labeling, re-label 30 random frames without looking at the
    first pass. Agreement between the passes is reported next to the results, so readers know how
    reliable the labels themselves are.
@@ -89,3 +97,6 @@ model is trained.
   - **Contact details:** a person's full name, phone, email, or home address entered in a form
     or document is `personal_id`.
   - **OS username in file paths** (e.g. `C:\Users\<name>`): not boxed.
+- 2026-10-22 (docs only, no rule changes): dataset path now documented as `GLASSVIEW_DATA`; the
+  split fractions actually used (0.55 / 0.30, seed 5) recorded in §4-5; Label Studio JSON is the
+  preferred export.

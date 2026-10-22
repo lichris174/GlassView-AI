@@ -15,8 +15,11 @@ eval:
 	$(PY) -m glassview_ai.evals.runner --threshold 1.0
 
 # Dataset: assign capture sessions to train/val/test (test is frozen on first run).
+# These are the fractions and seed the real split was frozen with (splits.json);
+# ml/splits.py's own defaults (0.35/0.15, seed 0) differ. Once splits.json exists
+# the flags are ignored: new sessions go to train and test/val stay fixed.
 split:
-	$(PY) -m ml.splits assign
+	$(PY) -m ml.splits assign --test-frac 0.55 --val-frac 0.30 --seed 5
 
 # Fails if any frozen test frame was added, removed, or modified.
 verify-split:

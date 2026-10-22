@@ -304,6 +304,8 @@ only vs. synthetic + a little real.
 
 Label import now remaps class ids by name, since Label Studio may number classes differently.
 
+---
+
 ## 2026-10-20 — Real screenshots captured, split frozen
 
 108 real frames in 9 sessions. 94 were captured by an unattended driver: it opened real apps
@@ -328,6 +330,8 @@ in real apps", not organic use.
 - **Gap: no real private_message frames.** Real chat sessions were skipped because they would
   capture the owner's real chat accounts. For private_message, real-screen recall cannot be
   measured, and synthetic results stand in for it. The report must say so.
+
+---
 
 ## 2026-10-21 — Labels imported and audited
 

@@ -1,3 +1,7 @@
+Historical (2026-06-26): the 2026-06 bugfix commit as a patch, superseded by README.md and
+docs/DEVLOG.md as of 2026-10-22. It is already in history; do not re-apply. (To feed it to
+`git am`, delete these lines first.)
+
 From f1212589b741eb86cbbc4bbfad41a9afd4bb19a6 Mon Sep 17 00:00:00 2001
 From: lichris174 <lichris174@gmail.com>
 Date: Fri, 26 Jun 2026 14:40:24 -0400

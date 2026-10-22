@@ -1,3 +1,5 @@
+> **Historical (2026-06), superseded by [README.md](../README.md) and [DEVLOG.md](DEVLOG.md) as of 2026-10-22.** Kept for reference; the backend is no longer Ollama-only, everything is committed, and the Voice panel listed here was removed in `2cf84ae` (2026-10-14).
+
 # GlassView — Session Handoff
 
 _Last updated: 2026-06-25. Status: Milestones A/B/C done and working, including region capture._
@@ -16,7 +18,7 @@ whole window to select a screen area and ask about it.
   README has the endpoint table. `/chat` streams plain `text/plain` token chunks (not SSE);
   omitting `image` reuses the chat's last image.
 - **Brief + visual reference:** `docs/files/GLASSVIEW_FRONTEND.md` + `docs/files/glassview-mockup.jsx`.
-- **Plan:** `~/.claude/plans/read-everything-in-c-users-lichr-onedriv-fuzzy-parasol.md`.
+- **Plan:** was a local Claude Code plan file (`~/.claude/plans/read-everything-in-c-users-lichr-onedriv-fuzzy-parasol.md`); it is not in the repo and no longer exists.
 
 ## How to run
 ```
